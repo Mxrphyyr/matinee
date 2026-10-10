@@ -12,11 +12,16 @@ if ! command -v gh >/dev/null; then
   echo "  Others:  https://cli.github.com"
   exit 1
 fi
-gh auth status >/dev/null 2>&1 || gh auth login --web --git-protocol https
+gh auth status >/dev/null 2>&1 || gh auth login --web --git-protocol https --scopes workflow
+# Pushing the release workflow (.github/workflows) needs GitHub's "workflow" permission.
+if ! gh auth status 2>&1 | grep -q "'workflow'"; then
+  echo "Allowing gh to push GitHub Actions workflows (needed once)…"
+  gh auth refresh -h github.com -s workflow
+fi
 if [ ! -d .git ]; then
   git init -b main
   git add -A
-  git commit -m "Matinee $(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+  git commit -m "Matinee $(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)"
 fi
 if git remote get-url origin >/dev/null 2>&1; then
   git push -u origin main
@@ -25,3 +30,4 @@ else
     --description "A private, ad-free YouTube client for Linux. Rust, GTK 4, libadwaita and mpv."
 fi
 echo "Published: $(gh repo view --json url -q .url)"
+echo "GitHub is building the first release now; see the Actions tab, then Releases."

@@ -1,0 +1,100 @@
+# Builds and tests Matinee on every push and pull request. When Cargo.toml
+# holds a version that hasn't been released yet (or a v* tag is pushed), the
+# same run publishes a GitHub release with a ready-to-install archive.
+# Start a release with: ./release.sh X.Y.Z
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build, test and release
+    # Stock Ubuntu 24.04 has GTK 4.14, libadwaita 1.5 and libmpv 2.2: what
+    # Matinee needs, and old enough that the build runs on newer systems too.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev libmpv-dev pkg-config
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo downloads and builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build and package
+        id: package
+        run: |
+          scripts/package.sh
+          version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=matinee-$version-$(uname -m)-linux" >> "$GITHUB_OUTPUT"
+
+      # Every run's build can be downloaded from the run's page, releases or not.
+      - name: Keep the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          tag="v$VERSION"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "$tag" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME doesn't match version $VERSION in Cargo.toml."
+              exit 1
+            fi
+          elif [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            echo "Releases are only published from $DEFAULT_BRANCH."
+            exit 0
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::$tag is already released. Run ./release.sh with a new version to publish another."
+            exit 0
+          fi
+          sed "s/{{VERSION}}/$VERSION/g" .github/release-notes.md > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" dist/*.tar.gz dist/*.sha256 \
+            --title "Matinee $VERSION" \
+            --target "$GITHUB_SHA" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --generate-notes

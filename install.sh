@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Builds Matinee and installs it for the current user only, under ~/.local.
+# Installs Matinee for the current user only, under ~/.local. From the source
+# code it builds Matinee first; a release download already holds the program.
 # Nothing is written to /usr, which keeps AerynOS's moss-managed system clean.
 #
-#   ./install.sh               build and install
+#   ./install.sh               install (building first from source)
 #   ./install.sh --check       only check that everything needed is installed
 #   ./install.sh --uninstall   remove the program, launcher entry and icon
 
@@ -28,6 +29,35 @@ refresh_menus() {
     elif have kbuildsycoca5; then kbuildsycoca5 >/dev/null 2>&1 || true; fi
 }
 
+# Playback and search need these at run time.
+check_tools() {
+    local yt_dlp_found=false
+    if have yt-dlp || [[ -x "$HOME/.local/bin/yt-dlp" ]]; then yt_dlp_found=true; fi
+    # shellcheck disable=SC1111  # typographic quotes inside a message
+    have mpv || warn "mpv isn't installed. Only “Open in mpv” needs it."
+    $yt_dlp_found || warn "yt-dlp isn't installed. Search and playback need it (README section 2c)."
+    return 0
+}
+
+# Copies the program, launcher entry and icon into ~/.local.
+install_files() {
+    say "Installing to $HOME/.local"
+    mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_DIR"
+    cp -f "$1" "$BIN_DIR/matinee"
+    chmod 755 "$BIN_DIR/matinee"
+    cp -f "$HERE/data/$APP_ID.svg" "$ICON_DIR/$APP_ID.svg"
+    # Use the full path: launchers often don't have ~/.local/bin on PATH.
+    local exec_path="$BIN_DIR/matinee"
+    if [[ "$exec_path" == *" "* ]]; then exec_path="\"$exec_path\""; fi
+    sed "s|^Exec=.*|Exec=$exec_path|" "$HERE/data/$APP_ID.desktop" > "$APPS_DIR/$APP_ID.desktop"
+    chmod 644 "$APPS_DIR/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg"
+    refresh_menus
+    say "Done. Open Matinee from your application launcher (Multimedia), or run:"
+    echo "    $BIN_DIR/matinee"
+    echo
+    echo "    First time? Import your subscriptions: README section 4."
+}
+
 case "$MODE" in
     install|--check|--uninstall) ;;
     *) fail "Unknown option '$MODE'. Use --check or --uninstall, or no option to install." ;;
@@ -39,6 +69,48 @@ if [[ "$MODE" == "--uninstall" ]]; then
     say "Matinee is uninstalled."
     echo "    Your channel list is still in $DATA_HOME/matinee."
     echo "    To remove it too: rm -rf \"$DATA_HOME/matinee\" \"${XDG_CACHE_HOME:-$HOME/.cache}/matinee\""
+    exit 0
+fi
+
+# ── Release downloads ──────────────────────────────────────────────────
+# A release holds a ready-made program beside this script and no source
+# code: check that it can run here, then install it. Nothing to build.
+if [[ -x "$HERE/matinee" && ! -f "$HERE/Cargo.toml" ]]; then
+    say "Checking that Matinee can run here"
+    if have ldd; then
+        # ldd fails outright on a program it cannot load; that case is explained below.
+        missing_libs="$(ldd "$HERE/matinee" 2>/dev/null | awk '/=> not found/ {print $1}' | sort -u || true)"
+        if [[ -n "$missing_libs" ]]; then
+            printf '\033[1;31mMissing libraries:\033[0m\n'
+            while read -r lib; do
+                case "$lib" in
+                    libgtk-4*)     hint="GTK 4.14 or newer" ;;
+                    libadwaita-1*) hint="libadwaita 1.5 or newer" ;;
+                    libmpv*)       hint="libmpv, from mpv 0.35 or newer" ;;
+                    *)             hint="" ;;
+                esac
+                echo "    $lib${hint:+   ($hint)}"
+            done <<< "$missing_libs"
+            echo
+            echo "    Install these with your package manager, then run ./install.sh again."
+            echo "    The release page lists the command for common systems."
+            exit 1
+        fi
+    fi
+    # The libraries exist; make sure they (and the C library) are new enough.
+    if ! problem="$("$HERE/matinee" --help 2>&1 >/dev/null)"; then
+        printf '\033[1;31mThis build of Matinee can'\''t run on this system:\033[0m\n'
+        echo "$problem" | head -n 5 | sed 's/^/    /'
+        echo
+        echo "    Release builds are made on Ubuntu 24.04. On older systems, build from source (README)."
+        exit 1
+    fi
+    check_tools
+    if [[ "$MODE" == "--check" ]]; then
+        say "Everything Matinee needs is installed."
+        exit 0
+    fi
+    install_files "$HERE/matinee"
     exit 0
 fi
 
@@ -123,11 +195,7 @@ fi
 echo "    Rust $(rustc --version | cut -d' ' -f2), GTK $(pkg-config --modversion gtk4), libadwaita $(pkg-config --modversion libadwaita-1), libmpv $(pkg-config --modversion mpv)"
 echo "    C compiler: ${CC:-cc}   archiver: ${AR:-ar}   linker: $linker"
 
-# Playback and search need these at run time, not to build.
-yt_dlp_found=false
-if have yt-dlp || [[ -x "$HOME/.local/bin/yt-dlp" ]]; then yt_dlp_found=true; fi
-have mpv || warn "mpv isn't installed. Only “Open in mpv” needs it:   sudo moss install 'binary(mpv)'"
-$yt_dlp_found || warn "yt-dlp isn't installed. Search and playback need it (README section 2c)."
+check_tools
 
 if [[ "$MODE" == "--check" ]]; then
     say "Everything needed to build Matinee is installed."
@@ -140,20 +208,4 @@ cd "$HERE"
 cargo build --release --locked
 
 # ── 4. Install ─────────────────────────────────────────────────────────
-say "Installing to $HOME/.local"
-mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_DIR"
-cp -f target/release/matinee "$BIN_DIR/matinee"
-chmod 755 "$BIN_DIR/matinee"
-cp -f "data/$APP_ID.svg" "$ICON_DIR/$APP_ID.svg"
-
-# Use the full path: launchers often don't have ~/.local/bin on PATH.
-exec_path="$BIN_DIR/matinee"
-[[ "$exec_path" == *" "* ]] && exec_path="\"$exec_path\""
-sed "s|^Exec=.*|Exec=$exec_path|" "data/$APP_ID.desktop" > "$APPS_DIR/$APP_ID.desktop"
-chmod 644 "$APPS_DIR/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg"
-refresh_menus
-
-say "Done. Open Matinee from your application launcher (Multimedia), or run:"
-echo "    $BIN_DIR/matinee"
-echo
-echo "    First time? Import your subscriptions: README section 4."
+install_files "$HERE/target/release/matinee"
