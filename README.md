@@ -600,18 +600,3 @@ for smooth playback.
 **Preferences** (main menu, or **Ctrl+,**): dark style, card size, Hide
 Shorts, how often to check for new videos, default quality, resuming, playing
 in a separate window, smooth scrolling, and the channel list.
-
-## Publishing on GitHub
-
-Matinee can't push to GitHub for you, but two scripts make it one command.
-They need git and the GitHub CLI (`sudo moss install 'binary(gh)'` on AerynOS).
-
-```
-./publish-to-github.sh          # first time: creates github.com/<you>/matinee and pushes
-./sync-to-github.sh "Message"   # afterwards: commits every change and pushes
-```
-
-`publish-to-github.sh my-name --private` picks another name or keeps the
-repository private. When a new version of Matinee arrives as an archive,
-unpack it over this folder (it never contains a `.git` folder, so your history
-is safe), then run `./sync-to-github.sh "Update to version x"`.
