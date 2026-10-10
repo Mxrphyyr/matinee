@@ -10,7 +10,7 @@ cd matinee-{{VERSION}}-x86_64-linux
 
 Matinee installs for your user only (into `~/.local`) and appears in your app launcher. `./install.sh --uninstall` removes it again.
 
-It needs GTK 4.14+, libadwaita 1.5+ and libmpv (mpv 0.35+), plus yt-dlp for search and playback. Keep yt-dlp up to date, since YouTube changes often. The installer names anything that's missing. Current yt-dlp also needs Deno to play YouTube videos; the README [shows how to install it](https://github.com/Mxrphyyr/matinee#2c-install-mpv-and-yt-dlp).
+It needs GTK 4.14+, libadwaita 1.5+ and libmpv (mpv 0.35+), plus yt-dlp for search and playback. Keep yt-dlp up to date, since YouTube changes often: Matinee can do it for you from Preferences. The installer names anything that's missing. Current yt-dlp also needs Deno to play YouTube videos; the README [shows how to install it](https://github.com/Mxrphyyr/matinee#2c-install-mpv-and-yt-dlp).
 
 | System | Command |
 |---|---|

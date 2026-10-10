@@ -215,3 +215,32 @@ the reasons.
   "Nothing saved yet"; the empty state now says the saved videos are Shorts.
 - The owner tried everything on the real desktop ("everything works") and
   0.6.0 was released, completing the three rounds planned on 2026-10-10.
+
+## 0.6.1: Update yt-dlp, and Shuffle's missing thumbnails
+
+- Shuffling Discover left the new cards without thumbnails (opening a group
+  could too). The thumbnail pass ran as soon as the list was replaced,
+  before GTK had laid out the new cards: all 25 were bound but none had a
+  place yet, so nothing counted as on screen and nothing was asked for.
+  Normally the scroll range changing after layout runs the pass again, but
+  Shuffle swaps 40 videos for 40 others, so the range never changed. Found
+  with temporary marks in the pass, in the hidden desktop. Now, when no
+  card has a place yet, the pass runs again after the grid's next frame.
+- Discover sometimes showed only 23 of its 40 picks: Shorts were picked,
+  then hidden by Hide Shorts. They're now left out before picking.
+- The first idea on the list, an in-app Update yt-dlp: a yt-dlp group in
+  Preferences, and the button on the player's "This video won't play" card
+  and on failure toasts. A yt-dlp in ~/.local/bin updates itself
+  (`yt-dlp -U`); one from the system's packages, or none, gets yt-dlp's own
+  standalone build put in ~/.local/bin, checked against the release's
+  published checksums, which Matinee prefers from then on. Never /usr, and
+  nothing is sent to YouTube. If the update changed yt-dlp, a video that
+  wouldn't play tries again.
+- Tested in the hidden desktop with throwaway homes: one with a copy of the
+  owner's yt-dlp ("yt-dlp is up to date (2026.08.19)") and one with none
+  (downloaded 40 MB from GitHub, checksum matched, installed, and the failed
+  video retried by itself). Review found that a second Update while one was
+  running left Preferences' spinner turning forever; later requests now wait
+  for the running update and hear how it went.
+- The owner tried Shuffle and the Update button on the real desktop
+  ("Everything is working great!") and 0.6.1 was released.

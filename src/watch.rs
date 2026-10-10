@@ -53,6 +53,8 @@ pub struct WatchHooks {
     /// Save this video for later, or remove it; says whether it's saved now.
     pub toggle_saved: Box<dyn Fn(&Video) -> bool>,
     pub is_saved: Box<dyn Fn(&str) -> bool>,
+    /// The viewer wants yt-dlp updated (a video wouldn't play).
+    pub update_yt_dlp: Box<dyn Fn()>,
 }
 
 /// How playback is going, for the desktop's media controls.
@@ -149,6 +151,8 @@ pub struct Watch {
     elsewhere: gtk::Button,
     /// Offered when a browser sign-in is the way past YouTube's refusal.
     choose_browser: gtk::Button,
+    /// Offered when a video won't play for no reason Matinee recognises.
+    update_button: gtk::Button,
     top: gtk::Revealer,
     bottom: gtk::Revealer,
     title: gtk::Label,
@@ -258,6 +262,9 @@ impl Watch {
         retry.add_css_class("suggested-action");
         let elsewhere = gtk::Button::with_label("Open in mpv");
         elsewhere.add_css_class("pill");
+        let update_button = gtk::Button::with_label("Update yt-dlp");
+        update_button.add_css_class("pill");
+        update_button.set_visible(false);
         let choose_browser = gtk::Button::with_label("Choose a browser…");
         choose_browser.add_css_class("pill");
         choose_browser.set_visible(false);
@@ -266,6 +273,7 @@ impl Watch {
         problem_buttons.set_margin_top(8);
         problem_buttons.append(&retry);
         problem_buttons.append(&elsewhere);
+        problem_buttons.append(&update_button);
         problem_buttons.append(&choose_browser);
         let problem = gtk::Box::new(gtk::Orientation::Vertical, 10);
         problem.add_css_class("problem");
@@ -481,6 +489,7 @@ impl Watch {
             problem_detail,
             elsewhere,
             choose_browser,
+            update_button,
             top,
             bottom,
             title,
@@ -581,6 +590,11 @@ impl Watch {
         on(retry, |w| w.retry());
         on(&self.elsewhere, |w| w.pop_out());
         on(&self.choose_browser, |w| (w.hooks.choose_sign_in)());
+        on(&self.update_button, |w| {
+            w.update_button.set_sensitive(false);
+            w.update_button.set_label("Updating…");
+            (w.hooks.update_yt_dlp)();
+        });
         on(pop_out, |w| w.pop_out());
         on(&self.subtitles_button, |w| w.toggle_subtitles());
         on(&self.save, |w| w.toggle_saved());
@@ -916,13 +930,7 @@ impl Watch {
         }
         let (tx, rx) = async_channel::bounded::<()>(1);
         let volume = format!("{:.0}", self.initial_volume.clamp(0.0, 100.0));
-        // Go straight to yt-dlp instead of first fetching the YouTube page itself,
-        // and say where yt-dlp is, since launchers can leave ~/.local/bin off PATH.
-        let mut script_opts = vec!["ytdl_hook-try_ytdl_first=yes".to_string()];
-        if let Some(path) = tools::find_yt_dlp() {
-            script_opts.push(format!("ytdl_hook-ytdl_path={}", path.display()));
-        }
-        let script_opts = script_opts.join(",");
+        let script_opts = ytdl_script_opts();
         // Compiled shaders are kept on disk, so after the first video the
         // first frame needn't wait for the compiler.
         let shader_cache = glib::user_cache_dir().join("matinee").join("shaders");
@@ -1110,6 +1118,7 @@ impl Watch {
         mpv.set_flag("pause", false);
         mpv.set_double("speed", SPEEDS[self.speed_index.get()]);
         mpv.set_string("ytdl-format", &self.format());
+        mpv.set_string("script-opts", &ytdl_script_opts());
         // The browser sign-in, if it's turned on in Preferences, and which
         // subtitles yt-dlp should list.
         mpv.set_string("ytdl-raw-options", &tools::mpv_ytdl_options());
@@ -1307,10 +1316,24 @@ impl Watch {
                 self.elsewhere.set_visible(false);
                 self.choose_browser.set_visible(true);
             }
-            None => self.show_problem(
-                "This video won't play",
-                &format!("{reason}\n\nUpdating yt-dlp usually fixes this."),
-            ),
+            None => {
+                self.show_problem(
+                    "This video won't play",
+                    &format!("{reason}\n\nUpdating yt-dlp usually fixes this."),
+                );
+                self.update_button.set_visible(true);
+            }
+        }
+    }
+
+    /// An update of yt-dlp finished; if it changed anything, a video that
+    /// couldn't play tries again.
+    pub fn yt_dlp_update_finished(self: &Rc<Self>, changed: bool) {
+        self.update_button.set_sensitive(true);
+        self.update_button.set_label("Update yt-dlp");
+        if changed && self.shown.get() && self.problem.is_visible() {
+            perf::mark("yt-dlp changed: trying the video again");
+            self.retry();
         }
     }
 
@@ -1320,6 +1343,7 @@ impl Watch {
         self.problem_detail.set_label(detail);
         self.elsewhere.set_visible(true);
         self.choose_browser.set_visible(false);
+        self.update_button.set_visible(false);
         self.problem.set_visible(true);
         self.top.set_reveal_child(true);
         self.bottom.set_reveal_child(false);
@@ -2086,6 +2110,19 @@ pub fn screen_height(window: Option<&gtk::Window>) -> u32 {
         h if h >= 1350 => 1440,
         _ => 1080,
     }
+}
+
+/// Options for mpv's YouTube hook: go straight to yt-dlp instead of first
+/// fetching the YouTube page itself, and use the yt-dlp Matinee found, since
+/// launchers can leave ~/.local/bin off PATH. Set again before each video:
+/// the hook looks yt-dlp up afresh when these change (an update can put a
+/// new copy in ~/.local/bin).
+fn ytdl_script_opts() -> String {
+    let mut script_opts = vec!["ytdl_hook-try_ytdl_first=yes".to_string()];
+    if let Some(path) = tools::find_yt_dlp() {
+        script_opts.push(format!("ytdl_hook-ytdl_path={}", path.display()));
+    }
+    script_opts.join(",")
 }
 
 /// Zero-copy hardware decoding, opt-in until it's proven on more drivers.

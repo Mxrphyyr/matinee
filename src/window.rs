@@ -12,7 +12,8 @@ use crate::mpris::{self, Mpris, Now};
 use crate::thumbs::{self, Thumbs};
 use crate::watch::{self, Playback, Watch, WatchHooks};
 use crate::{
-    discover, feed, history, icons, perf, player, resolve, search, smooth, style, tools, trending, util, ytdlp, APP_ID,
+    discover, feed, history, icons, perf, player, resolve, search, smooth, style, tools, trending, updater, util,
+    ytdlp, APP_ID,
 };
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
@@ -120,6 +121,9 @@ struct SidebarFilter {
     names: RefCell<Vec<String>>,
 }
 
+/// Hears how an update of yt-dlp went.
+type UpdateDone = Box<dyn Fn(&Result<updater::Outcome, String>)>;
+
 pub struct Win {
     pub window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
@@ -198,12 +202,16 @@ pub struct Win {
     /// More older uploads have been asked for and haven't arrived yet.
     history_asked: Cell<bool>,
     refreshing: Cell<bool>,
+    /// While yt-dlp is being updated, who else wants to hear how it went.
+    update_waiters: RefCell<Option<Vec<UpdateDone>>>,
     busy: Cell<u32>,
     search_gen: Cell<u64>,
     suppress_select: Cell<bool>,
     hero_flip: Cell<bool>,
     header_raised: Cell<bool>,
     visibility_queued: Cell<bool>,
+    /// A thumbnail pass is waiting for the grid's next layout.
+    visibility_after_layout: Cell<bool>,
     last_visibility: Cell<i64>,
     scroll_animation: RefCell<Option<adw::TimedAnimation>>,
 }
@@ -558,12 +566,14 @@ impl Win {
                 history_stream: RefCell::default(),
                 history_asked: Cell::new(false),
                 refreshing: Cell::new(false),
+                update_waiters: RefCell::default(),
                 busy: Cell::new(0),
                 search_gen: Cell::new(0),
                 suppress_select: Cell::new(false),
                 hero_flip: Cell::new(false),
                 header_raised: Cell::new(false),
                 visibility_queued: Cell::new(false),
+                visibility_after_layout: Cell::new(false),
                 last_visibility: Cell::new(0),
                 scroll_animation: RefCell::default(),
             }
@@ -846,6 +856,7 @@ impl Win {
         self.action("sign-in", |w| w.sign_in_dialog());
         self.action("toggle-subtitles", |w| w.watch.toggle_subtitles());
         self.action("groups", |w| w.groups_dialog());
+        self.action("update-yt-dlp", |w| w.update_yt_dlp(None));
         self.action("mark-all-watched", |w| w.mark_all_watched());
         self.action("shuffle", |w| w.shuffle());
         self.action_with_id("view", |w, name| {
@@ -1344,6 +1355,10 @@ impl Win {
         for older in self.history.borrow().values() {
             candidates.extend(older.iter().cloned());
         }
+        // Shorts that would only be hidden mustn't take up picks.
+        if st.hide_shorts {
+            candidates.retain(|v| !v.is_short);
+        }
         discover::pick(&candidates, &st.watched, now, self.discover_seed.get())
     }
 
@@ -1629,7 +1644,7 @@ impl Win {
     /// behind, nearest first, and lets go of images far away so memory stays
     /// flat on long scrolls. The grid only positions on-screen cards, so
     /// "ahead" is counted in places in the feed rather than in pixels.
-    fn update_visibility(&self) {
+    fn update_visibility(self: &Rc<Self>) {
         let _timing = perf::span("thumbnail pass", 2);
         let height = self.scroller.height() as f32;
         if height <= 0.0 {
@@ -1643,18 +1658,25 @@ impl Win {
             .cloned()
             .collect();
         let (mut first, mut last) = (u32::MAX, 0);
+        let mut unplaced = false;
         for card in &cards {
-            let Some(bounds) = card.root.compute_bounds(&self.scroller) else { continue };
-            let on_screen = bounds.width() > 0.0
-                && bounds.height() > 0.0
-                && bounds.y() + bounds.height() >= 0.0
-                && bounds.y() <= height;
-            if on_screen {
+            let bounds = card.root.compute_bounds(&self.scroller).filter(|b| b.width() > 0.0 && b.height() > 0.0);
+            let Some(bounds) = bounds else {
+                unplaced = true;
+                continue;
+            };
+            if bounds.y() + bounds.height() >= 0.0 && bounds.y() <= height {
                 first = first.min(card.position());
                 last = last.max(card.position());
             }
         }
         if first == u32::MAX {
+            // Cards for a list just put in the grid only get their places at
+            // its next layout, and when the new list is as long as the old
+            // (a shuffle), nothing else would ask again.
+            if unplaced {
+                self.update_visibility_after_layout();
+            }
             return;
         }
         let screen = last - first + 1;
@@ -1689,6 +1711,31 @@ impl Win {
         for (_, card) in wanted {
             self.request_thumb(&card);
         }
+    }
+
+    /// Runs the thumbnail pass once the grid's next frame has been laid out
+    /// and drawn. Nothing happens while the grid is off screen; showing it
+    /// fills it, which asks again.
+    fn update_visibility_after_layout(self: &Rc<Self>) {
+        if !self.grid.is_mapped() || self.visibility_after_layout.replace(true) {
+            return;
+        }
+        let Some(clock) = self.grid.frame_clock() else {
+            self.visibility_after_layout.set(false);
+            return;
+        };
+        let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+        let (weak, slot) = (Rc::downgrade(self), handler.clone());
+        let id = clock.connect_after_paint(move |clock| {
+            if let Some(id) = slot.borrow_mut().take() {
+                clock.disconnect(id);
+            }
+            if let Some(win) = weak.upgrade() {
+                win.visibility_after_layout.set(false);
+                win.update_visibility();
+            }
+        });
+        *handler.borrow_mut() = Some(id);
     }
 
     fn request_thumb(&self, card: &Rc<Card>) {
@@ -3037,13 +3084,68 @@ impl Win {
         playback.add(&external_row);
         playback.add(&sign_in_row);
 
+        // yt-dlp: which one, and a way to update it.
+        let yt_dlp = adw::PreferencesGroup::builder()
+            .title("yt-dlp")
+            .description(
+                "Matinee plays and searches YouTube through yt-dlp, which needs updating now and then as \
+                 YouTube changes.",
+            )
+            .build();
+        let yt_dlp_row = adw::ActionRow::builder().title("Version").subtitle("Checking…").build();
+        let update_spinner = gtk::Spinner::new();
+        update_spinner.set_visible(false);
+        let update_button = gtk::Button::builder().label("Update").valign(gtk::Align::Center).build();
+        yt_dlp_row.add_suffix(&update_spinner);
+        yt_dlp_row.add_suffix(&update_button);
+        yt_dlp.add(&yt_dlp_row);
+        let show_found = {
+            let (row, button) = (yt_dlp_row.clone(), update_button.clone());
+            move || {
+                let (row, button) = (row.clone(), button.clone());
+                glib::spawn_future_local(async move {
+                    let found = gio::spawn_blocking(updater::found).await.ok().flatten();
+                    row.set_subtitle(&updater::summary(found.as_ref()));
+                    button.set_label(if found.is_some() { "Update" } else { "Install" });
+                });
+            }
+        };
+        // Starts an update, or follows the one already running, until it's done.
+        let follow = {
+            let (this, show_found) = (self.clone(), show_found.clone());
+            let (row, spinner, button) = (yt_dlp_row.clone(), update_spinner.clone(), update_button.clone());
+            move || {
+                button.set_sensitive(false);
+                spinner.set_visible(true);
+                spinner.set_spinning(true);
+                row.set_subtitle("Checking GitHub for a new version…");
+                let (row, spinner, button, show_found) = (row.clone(), spinner.clone(), button.clone(), show_found.clone());
+                this.update_yt_dlp(Some(Box::new(move |result| {
+                    spinner.set_spinning(false);
+                    spinner.set_visible(false);
+                    button.set_sensitive(true);
+                    match result {
+                        Ok(_) => show_found(),
+                        Err(message) => row.set_subtitle(message),
+                    }
+                })));
+            }
+        };
+        let running = self.update_waiters.borrow().is_some();
+        if running {
+            follow();
+        } else {
+            show_found();
+        }
+        update_button.connect_clicked(move |_| follow());
+
         let browsing = adw::PreferencesGroup::builder().title("Browsing").build();
         let smooth_row = switch_row("Smooth wheel scrolling", "Glide with each wheel notch instead of jumping", smooth_scrolling);
         let sidebar_row = switch_row("Show the channel list", "Also F9 or the button at the top left", self.split.shows_sidebar());
         browsing.add(&smooth_row);
         browsing.add(&sidebar_row);
 
-        for group in [&appearance, &feed, &playback, &browsing] {
+        for group in [&appearance, &feed, &playback, &yt_dlp, &browsing] {
             page.add(group);
         }
 
@@ -3113,13 +3215,47 @@ impl Win {
     /// sign-in; `otherwise` for any other failure.
     fn toast_refusal(&self, reason: &str, sign_in: Option<&tools::Browser>, otherwise: &str) {
         let Some(explained) = util::explain_ytdlp(reason, sign_in) else {
-            self.toast(otherwise);
+            // Anything else is most often an old yt-dlp.
+            let toast = self.toast(otherwise);
+            toast.set_button_label(Some("Update yt-dlp"));
+            toast.set_action_name(Some("win.update-yt-dlp"));
+            toast.set_timeout(10);
             return;
         };
         let toast = self.toast(&explained.title);
         toast.set_button_label(Some("Choose a browser…"));
         toast.set_action_name(Some("win.sign-in"));
         toast.set_timeout(10);
+    }
+
+    /// Brings yt-dlp up to date in the background and says how it went;
+    /// `done` hears the outcome too. A video that couldn't play tries again.
+    /// Asking while an update runs waits for that one.
+    fn update_yt_dlp(self: &Rc<Self>, done: Option<UpdateDone>) {
+        {
+            let mut waiters = self.update_waiters.borrow_mut();
+            if let Some(waiters) = waiters.as_mut() {
+                waiters.extend(done);
+                return;
+            }
+            *waiters = Some(done.into_iter().collect());
+        }
+        let pending = self.toast("Updating yt-dlp…");
+        pending.set_timeout(0);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(updater::update)
+                .await
+                .unwrap_or_else(|_| Err("The update stopped unexpectedly. Try again.".to_string()));
+            pending.dismiss();
+            let changed = result.as_ref().is_ok_and(updater::Outcome::changed);
+            let toast = this.toast(&updater::describe(&result));
+            toast.set_timeout(if result.is_ok() { 5 } else { 10 });
+            for done in this.update_waiters.take().unwrap_or_default() {
+                done(&result);
+            }
+            this.watch.yt_dlp_update_finished(changed);
+        });
     }
 
     /// The choices for the browser sign-in: off, the browsers set up here,
@@ -3324,6 +3460,14 @@ fn watch_hooks(weak: &Weak<Win>) -> WatchHooks {
         is_saved: Box::new({
             let weak = weak.clone();
             move |id: &str| weak.upgrade().is_some_and(|win| win.store.borrow().is_saved(id))
+        }),
+        update_yt_dlp: Box::new({
+            let weak = weak.clone();
+            move || {
+                if let Some(win) = weak.upgrade() {
+                    win.update_yt_dlp(None);
+                }
+            }
         }),
     }
 }

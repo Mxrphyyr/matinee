@@ -41,7 +41,7 @@ YouTube extraction.
 
 ## Commands
 
-- `cargo build`, `cargo test` (26 unit tests of pure logic; no display needed).
+- `cargo build`, `cargo test` (34 unit tests of pure logic; no display needed).
   AerynOS has no GNU `ar`: plain cargo needs `AR=llvm-ar` (install.sh sets it).
 - `cargo run` opens the app on the owner's desktop
 - `MATINEE_PERF=1 ~/.local/bin/matinee` prints timing: start-up stages, a
@@ -65,9 +65,10 @@ ubuntu-24.04, whose GTK 4.14, libadwaita 1.5 and libmpv 2.2 match the crate
 features (`gtk` v4_12, `adw` v1_5). It tests, packages
 `matinee-X.Y.Z-x86_64-linux.tar.gz` plus `.sha256`, and when the version in
 Cargo.toml has no release yet, publishes one with the notes in
-`.github/release-notes.md` plus GitHub's generated notes. Published so far:
-v0.3.0, v0.3.1, v0.3.2, v0.4.0, v0.5.0 and v0.6.0. The owner's gh login has the `workflow` scope needed to
-push workflow changes. A release archive installs with its own `./install.sh`,
+`.github/release-notes.md` (one template for every release, `{{VERSION}}`
+filled in) plus GitHub's generated notes. Published so far: v0.3.0, v0.3.1,
+v0.3.2, v0.4.0, v0.5.0, v0.6.0 and v0.6.1. The owner's gh login has the
+`workflow` scope needed to push workflow changes. A release archive installs with its own `./install.sh`,
 which detects the prebuilt binary and checks libraries before installing.
 
 ## Code map (src/)
@@ -82,6 +83,7 @@ which detects the prebuilt binary and checks libraries before installing.
 | `watch.rs` | embedded player: `Surface` (GLArea plus the one mpv renderer), picture in picture, quality menu, controls, errors |
 | `mpv.rs` | libmpv FFI: client API and OpenGL render API, EGL/GLX proc lookup |
 | `mpris.rs` | the desktop's media controls and media keys: MPRIS on the session bus through gio, no extra crates |
+| `net.rs` | every HTTP request (ureq): feeds, pages, thumbnails; `fetch_text` and `download_to` (streams a big file to disk, returns its SHA-256) for the updater |
 | `feed.rs` | channel RSS (Atom) feeds: 8 at once on a first load, later 4 at once with pauses; one retry |
 | `ytdlp.rs` | runs yt-dlp for a list and streams its entries as they arrive; optional page gating (reading pauses until `more`) |
 | `history.rs` | a channel's older uploads: `ytdlp` with 60 per page, `--sleep-requests 1` |
@@ -92,6 +94,7 @@ which detects the prebuilt binary and checks libraries before installing.
 | `resolve.rs` | channel ids from links and @handles; Takeout, NewPipe, FreeTube and OPML import |
 | `store.rs` | `~/.local/share/matinee/state.json`; every field has a serde default |
 | `tools.rs` | finds yt-dlp (prefers ~/.local/bin) and mpv; browser detection and the sign-in arguments |
+| `updater.rs` | Update yt-dlp: `yt-dlp -U` for a copy in ~/.local/bin, otherwise downloads yt-dlp's standalone build there, checked against the release's `SHA2-256SUMS` |
 | `util.rs` | formatting helpers; `explain_ytdlp` turns yt-dlp errors into plain words |
 | `player.rs` | external mpv ("Open in mpv"); reads mpv's output to explain failures |
 | `style.rs`, `data/style.css` | light/dark palette and all CSS (embedded at build time) |
@@ -107,6 +110,10 @@ which detects the prebuilt binary and checks libraries before installing.
   beyond three screens. A view's list goes into the grid in slices
   (`fill_grid`: the first screens at once, then 200 per idle moment);
   appends (older uploads, search results) queue behind pending slices.
+  Cards for a new list get their places only at the grid's next layout, so
+  when the pass finds none placed it runs again after the next frame
+  (`update_visibility_after_layout`); otherwise a list as long as the old
+  one (Shuffle) got no thumbnails.
 - **Start-up.** `Win::start` shows the loading page with the greeting, and
   fills the feed, then the channel list, in idles after the first frame
   (`fill_in`). Measured in the hidden test desktop: GTK's own init is 1.3 s
@@ -165,6 +172,19 @@ which detects the prebuilt binary and checks libraries before installing.
   `~/.local/bin/yt-dlp -U`) plus Deno in ~/.local/bin, with
   `--js-runtimes deno:$HOME/.local/bin/deno` in `~/.config/yt-dlp/config`;
   current yt-dlp needs a JavaScript runtime for YouTube.
+- **Updating yt-dlp.** Preferences has a yt-dlp group (version in use,
+  Update, or Install when there's none); the player's "This video won't
+  play" card and failure toasts offer "Update yt-dlp" too (window action
+  `update-yt-dlp`). `updater::update` runs off the UI thread: a yt-dlp in
+  ~/.local/bin updates itself with `-U` (a pip or pipx copy can't, and the
+  message says so); otherwise the standalone `yt-dlp_linux` (or
+  `_aarch64`) is downloaded into ~/.local/bin, checked against the
+  release's `SHA2-256SUMS`, test-run, then renamed into place. Never /usr,
+  and only GitHub is contacted. mpv gets yt-dlp's path in `script-opts`
+  before each video (ytdl_hook looks yt-dlp up again when they change), so
+  a new copy works without a restart; if the update changed yt-dlp, a video
+  showing the problem card retries. One update at a time: asking again
+  waits for the running one (`update_waiters`).
 - **Browser sign-in.** When YouTube refuses a connection, every player type
   answers LOGIN_REQUIRED; only a signed-in request gets through. The sign-in
   is borrowed from a browser (Preferences, Playback, or "Choose a browser…"
@@ -196,13 +216,14 @@ which detects the prebuilt binary and checks libraries before installing.
   `Group { id, name, channels }` with ids like `g<time>-<n>`; `store.filter`
   remembers All/Unwatched/This week. Discover = `discover::pick` over the
   feed plus any older uploads read this session, weight = freshness ×
-  (1 + 2·affinity) × doing-well, max two per channel, 40 picks; the hero
-  action is Shuffle. Group dialogs are `adw::Dialog`s: a manager (main menu
+  (1 + 2·affinity) × doing-well, max two per channel, 40 picks; with Hide
+  Shorts on, Shorts are left out before picking. The hero action is Shuffle. Group dialogs are `adw::Dialog`s: a manager (main menu
   Groups…), an editor (name entry + channel checklist; the name applies on
   close since the sidebar is rebuilt) and a per-channel membership dialog
   (Add to group… on channel pages). Window actions for tests: `view`
   (feed/trending/discover/watch-later), `shuffle`, `toggle-saved`,
-  `show-group`, `edit-group`, `add-to-group`, `groups`, `mark-all-watched`.
+  `show-group`, `edit-group`, `add-to-group`, `groups`, `mark-all-watched`,
+  `update-yt-dlp`.
 
 ## Testing
 
@@ -228,7 +249,6 @@ real `state.json` (with `last_refresh` set to now) makes a realistic feed.
 
 ## Ideas not done yet
 
-- An in-app "Update yt-dlp" button (download yt-dlp_linux into ~/.local/bin).
 - A PO token provider (the bgutil yt-dlp plugin) might let playback through
   without a sign-in; untested, and another moving part to maintain.
 - Link the About dialog to the repository; the app id could become

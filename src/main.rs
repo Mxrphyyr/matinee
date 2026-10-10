@@ -20,6 +20,7 @@ mod thumb;
 mod thumbs;
 mod tools;
 mod trending;
+mod updater;
 mod util;
 mod watch;
 mod window;

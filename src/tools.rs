@@ -127,7 +127,7 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-fn is_executable(path: &Path) -> bool {
+pub fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
