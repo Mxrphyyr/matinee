@@ -175,3 +175,49 @@ mod tests {
         assert_eq!(duration(3723), "1:02:03");
     }
 }
+
+/// Plain words for the YouTube refusals people actually meet, in place of
+/// yt-dlp's command-line advice. Returns a title and an explanation.
+pub fn explain_ytdlp(message: &str) -> Option<(&'static str, &'static str)> {
+    let message = message.to_lowercase().replace('\u{2019}', "'");
+    if message.contains("not a bot") {
+        Some((
+            "YouTube wants to check you're not a bot",
+            "YouTube asks this after a burst of requests from your internet connection, \
+             or to people on a VPN. It usually clears up within a few hours.\n\n\
+             Meanwhile, try turning off any VPN or updating yt-dlp. If it keeps happening, \
+             Matinee can use your browser's YouTube sign-in (Preferences, then Playback).",
+        ))
+    } else if message.contains("confirm your age") || message.contains("age-restricted") {
+        Some((
+            "This video is age-restricted",
+            "YouTube only shows it to signed-in adults. To watch it here, let Matinee use \
+             your browser's YouTube sign-in (Preferences, then Playback), or open it in your browser.",
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::explain_ytdlp;
+
+    #[test]
+    fn explains_the_bot_check() {
+        let raw = "Sign in to confirm you\u{2019}re not a bot. Use --cookies-from-browser or --cookies for the authentication.";
+        let (title, detail) = explain_ytdlp(raw).expect("recognised");
+        assert!(title.contains("not a bot"));
+        assert!(detail.contains("Preferences") && !detail.contains("--cookies"));
+    }
+
+    #[test]
+    fn explains_age_restrictions() {
+        assert!(explain_ytdlp("Sign in to confirm your age. This video may be inappropriate").is_some());
+    }
+
+    #[test]
+    fn leaves_other_errors_alone() {
+        assert!(explain_ytdlp("Video unavailable. This video has been removed by the uploader").is_none());
+    }
+}

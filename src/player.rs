@@ -34,8 +34,13 @@ pub fn spawn(video: &Video, start: Option<f64>) -> Result<Child, String> {
                 cmd.arg(format!("--start={start:.1}"));
             }
             // Launchers can leave ~/.local/bin off PATH; tell mpv where yt-dlp is.
-            if let Some(path) = crate::tools::find("yt-dlp") {
+            if let Some(path) = crate::tools::find_yt_dlp() {
                 cmd.arg(format!("--script-opts=ytdl_hook-ytdl_path={}", path.display()));
+            }
+            // The browser sign-in, if it's turned on in Preferences.
+            let raw = crate::tools::mpv_raw_options();
+            if !raw.is_empty() {
+                cmd.arg(format!("--ytdl-raw-options={raw}"));
             }
             cmd
         }

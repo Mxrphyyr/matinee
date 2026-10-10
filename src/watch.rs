@@ -728,7 +728,7 @@ impl Watch {
         // Go straight to yt-dlp instead of first fetching the YouTube page itself,
         // and say where yt-dlp is, since launchers can leave ~/.local/bin off PATH.
         let mut script_opts = vec!["ytdl_hook-try_ytdl_first=yes".to_string()];
-        if let Some(path) = tools::find("yt-dlp") {
+        if let Some(path) = tools::find_yt_dlp() {
             script_opts.push(format!("ytdl_hook-ytdl_path={}", path.display()));
         }
         let script_opts = script_opts.join(",");
@@ -885,6 +885,8 @@ impl Watch {
         mpv.set_flag("pause", false);
         mpv.set_double("speed", SPEEDS[self.speed_index.get()]);
         mpv.set_string("ytdl-format", &self.format());
+        // The browser sign-in, if it's turned on in Preferences.
+        mpv.set_string("ytdl-raw-options", &tools::mpv_raw_options());
         // Applies to this file only; reset once it has loaded.
         let start = self.resume_at.get();
         mpv.set_string("start", &if start > 0.0 { format!("{start:.1}") } else { "none".to_string() });
@@ -1032,10 +1034,13 @@ impl Watch {
         }
         let reason = self.last_error.borrow().clone();
         let reason = if reason.is_empty() { mpv::error_string(code) } else { reason };
-        self.show_problem(
-            "This video won't play",
-            &format!("{reason}\n\nUpdating yt-dlp usually fixes this."),
-        );
+        match util::explain_ytdlp(&reason) {
+            Some((title, detail)) => self.show_problem(title, detail),
+            None => self.show_problem(
+                "This video won't play",
+                &format!("{reason}\n\nUpdating yt-dlp usually fixes this."),
+            ),
+        }
     }
 
     fn show_problem(&self, title: &str, detail: &str) {

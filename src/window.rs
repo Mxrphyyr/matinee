@@ -10,7 +10,7 @@ use crate::model::{Channel, Video};
 use crate::store::{Store, WindowState};
 use crate::thumbs::Thumbs;
 use crate::watch::{Watch, WatchHooks};
-use crate::{feed, history, icons, player, resolve, search, smooth, style, trending, util, APP_ID};
+use crate::{feed, history, icons, player, resolve, search, smooth, style, tools, trending, util, APP_ID};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
@@ -44,6 +44,17 @@ const REFRESH_CHOICES: [(u32, &str); 4] = [
     (20, "Every 20 minutes"),
     (60, "Every hour"),
     (0, "Only when I refresh"),
+];
+/// Browsers yt-dlp can borrow a YouTube sign-in from.
+const BROWSERS: [(Option<&str>, &str); 8] = [
+    (None, "Off"),
+    (Some("firefox"), "Firefox"),
+    (Some("chrome"), "Google Chrome"),
+    (Some("chromium"), "Chromium"),
+    (Some("brave"), "Brave"),
+    (Some("edge"), "Microsoft Edge"),
+    (Some("vivaldi"), "Vivaldi"),
+    (Some("opera"), "Opera"),
 ];
 
 #[derive(Clone, PartialEq)]
@@ -143,6 +154,8 @@ pub struct Win {
     history: RefCell<HashMap<String, Vec<Video>>>,
     history_done: RefCell<HashSet<String>>,
     history_stream: RefCell<Option<(String, history::Stream)>>,
+    /// More older uploads have been asked for and haven't arrived yet.
+    history_asked: Cell<bool>,
     refreshing: Cell<bool>,
     busy: Cell<u32>,
     search_gen: Cell<u64>,
@@ -481,6 +494,7 @@ impl Win {
                 history: RefCell::default(),
                 history_done: RefCell::default(),
                 history_stream: RefCell::default(),
+                history_asked: Cell::new(false),
                 refreshing: Cell::new(false),
                 busy: Cell::new(0),
                 search_gen: Cell::new(0),
@@ -505,6 +519,7 @@ impl Win {
         };
         style::set_always_dark(always_dark);
         smooth::set_enabled(smooth_scrolling);
+        tools::set_cookies_browser(self.store.borrow().cookies_browser.clone());
         self.rebuild_sidebar();
         let (has_channels, has_feed) = {
             let st = self.store.borrow();
@@ -1085,6 +1100,7 @@ impl Win {
         // Without yt-dlp the channel page simply shows its newest videos.
         let Ok((stream, batches)) = history::start(id, &name) else { return };
         *self.history_stream.borrow_mut() = Some((id.to_string(), stream));
+        self.history_asked.set(false);
         let this = self.clone();
         let id = id.to_string();
         glib::spawn_future_local(async move {
@@ -1096,6 +1112,7 @@ impl Win {
     }
 
     fn add_history(self: &Rc<Self>, id: &str, batch: Vec<Video>) {
+        self.history_asked.set(false);
         let added: Vec<Video> = {
             let st = self.store.borrow();
             let mut history = self.history.borrow_mut();
@@ -1142,6 +1159,17 @@ impl Win {
                     self.note.set_label("This channel has no videos to show.");
                 }
                 self.update_hero(false);
+            }
+        }
+    }
+
+    /// Near the end of a channel's list: read the next page of older uploads.
+    fn want_more_history(&self) {
+        let View::Channel(id) = self.view.borrow().clone() else { return };
+        let streams = self.history_stream.borrow();
+        if let Some((running, stream)) = streams.as_ref() {
+            if *running == id && !self.history_asked.replace(true) {
+                stream.more();
             }
         }
     }
@@ -1275,6 +1303,9 @@ impl Win {
             return;
         }
         let screen = last - first + 1;
+        if last + 2 * screen >= self.model.n_items() {
+            self.want_more_history();
+        }
         let near = first.saturating_sub(screen)..=last + screen;
         let kept = first.saturating_sub(3 * screen)..=last + 3 * screen;
         let mut wanted: Vec<(u32, Rc<Card>)> = Vec::new();
@@ -1352,7 +1383,7 @@ impl Win {
                 ),
                 View::Channel(id) => {
                     let sub = if self.history_running(id) {
-                        format!("{} so far, loading older ones", util::count(shown, "video", "videos"))
+                        format!("{} so far; older ones load as you scroll", util::count(shown, "video", "videos"))
                     } else {
                         util::count(shown, "video", "videos")
                     };
@@ -2036,9 +2067,17 @@ impl Win {
         quality_row.set_subtitle("Where a video starts; change it for one video from the player");
         let resume_row = switch_row("Resume where I left off", "", resume);
         let external_row = switch_row("Play in a separate window", "Open videos in mpv's own window", external);
+        let cookies = self.store.borrow().cookies_browser.clone();
+        let browser_labels: Vec<&str> = BROWSERS.iter().map(|(_, label)| *label).collect();
+        let browser_index = BROWSERS.iter().position(|(b, _)| *b == cookies.as_deref()).unwrap_or(0);
+        let cookies_row = combo_row("Use a browser's YouTube sign-in", &browser_labels, browser_index);
+        cookies_row.set_subtitle(
+            "Only if YouTube keeps asking whether you're a bot. YouTube can then link what you watch to that account.",
+        );
         playback.add(&quality_row);
         playback.add(&resume_row);
         playback.add(&external_row);
+        playback.add(&cookies_row);
 
         let browsing = adw::PreferencesGroup::builder().title("Browsing").build();
         let smooth_row = switch_row("Smooth wheel scrolling", "Glide with each wheel notch instead of jumping", smooth_scrolling);
@@ -2077,6 +2116,13 @@ impl Win {
         });
         let this = self.clone();
         external_row.connect_active_notify(move |row| this.set_toggle("external-player", row.is_active()));
+        let this = self.clone();
+        cookies_row.connect_selected_notify(move |row| {
+            let browser = BROWSERS[(row.selected() as usize).min(BROWSERS.len() - 1)].0.map(str::to_string);
+            tools::set_cookies_browser(browser.clone());
+            this.store.borrow_mut().cookies_browser = browser;
+            this.save_later();
+        });
         let this = self.clone();
         smooth_row.connect_active_notify(move |row| {
             this.store.borrow_mut().no_smooth_scroll = !row.is_active();

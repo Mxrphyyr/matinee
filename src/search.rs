@@ -29,6 +29,7 @@ struct Entry {
 pub fn search(query: &str, limit: usize) -> Result<Vec<Video>, String> {
     let output = Command::new(crate::tools::yt_dlp())
         .args(["--flat-playlist", "--dump-single-json", "--no-warnings", "--quiet"])
+        .args(crate::tools::yt_dlp_args())
         .arg(format!("ytsearch{limit}:{query}"))
         .output()
         .map_err(|e| {
@@ -45,7 +46,11 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Video>, String> {
             .rev()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("no error message");
-        return Err(format!("yt-dlp couldn't search: {}", last.trim()));
+        let last = last.trim();
+        if let Some((title, detail)) = crate::util::explain_ytdlp(last) {
+            return Err(format!("{title}. {detail}"));
+        }
+        return Err(format!("yt-dlp couldn't search: {last}"));
     }
     parse(&output.stdout)
 }

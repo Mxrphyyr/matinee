@@ -52,6 +52,9 @@ pub struct Store {
     pub no_smooth_scroll: bool,
     #[serde(default)]
     pub no_resume: bool,
+    /// The browser whose YouTube sign-in yt-dlp may borrow; None means never.
+    #[serde(default)]
+    pub cookies_browser: Option<String>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]

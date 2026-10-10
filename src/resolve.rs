@@ -84,6 +84,7 @@ fn from_page(url: &str) -> Result<String, String> {
 fn from_ytdlp(url: &str) -> Option<String> {
     let out = Command::new(crate::tools::yt_dlp())
         .args(["--flat-playlist", "--playlist-items", "0", "--dump-single-json", "--no-warnings"])
+        .args(crate::tools::yt_dlp_args())
         .arg(url)
         .output()
         .ok()?;
