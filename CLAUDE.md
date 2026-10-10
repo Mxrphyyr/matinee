@@ -62,7 +62,7 @@ features (`gtk` v4_12, `adw` v1_5). It tests, packages
 `matinee-X.Y.Z-x86_64-linux.tar.gz` plus `.sha256`, and when the version in
 Cargo.toml has no release yet, publishes one with the notes in
 `.github/release-notes.md` plus GitHub's generated notes. Published so far:
-v0.3.0 and v0.3.1. The owner's gh login has the `workflow` scope needed to
+v0.3.0, v0.3.1 and v0.3.2. The owner's gh login has the `workflow` scope needed to
 push workflow changes. A release archive installs with its own `./install.sh`,
 which detects the prebuilt binary and checks libraries before installing.
 
