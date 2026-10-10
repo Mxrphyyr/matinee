@@ -124,7 +124,8 @@ chmod +x ~/.local/bin/yt-dlp
 ```
 
 Matinee looks for yt-dlp in `~/.local/bin` even when that folder isn't on
-your `PATH`, and passes its location to mpv.
+your `PATH`, and passes its location to mpv. Once Matinee is installed, it can
+also do this for you: open Preferences and click **Install** next to yt-dlp.
 
 Current yt-dlp also needs Deno, a JavaScript runtime, to play YouTube videos.
 Its standalone build goes in the same folder:
@@ -375,7 +376,7 @@ browser…** instead (see [section 7](#7-keeping-playback-working)).
 - **Mark all as watched:** everything shown right now, after asking.
 - **Preferences:** dark style, card size, how often to check for new videos,
   video quality, playing in a separate window, a browser's YouTube sign-in,
-  and more (see the end of this page).
+  updating yt-dlp, and more (see the end of this page).
 - **About Matinee**
 
 Matinee checks for new uploads when it starts (unless it checked in the last
@@ -399,6 +400,7 @@ choose to (see below). Here is every kind of request it makes:
 | Search | when you search, through yt-dlp | youtube.com |
 | A video's details and streams | when you play, through yt-dlp and libmpv | youtube.com, googlevideo.com |
 | A video's captions | only when subtitles are turned on | youtube.com |
+| yt-dlp itself | only when you click **Update** or **Install** for yt-dlp | github.com |
 
 The only cookie sent is `SOCS=CAI`, which *declines* YouTube's cookie-consent
 prompt in the EU, unless you turn on a browser's YouTube sign-in
@@ -424,8 +426,17 @@ Everything Matinee remembers stays on your computer:
 
 YouTube changes its internals often. When it does, yt-dlp (and therefore
 playback and search) can break until yt-dlp is updated, which usually happens
-within days. If a video won't play, the player says so and shows yt-dlp's
-own explanation. Update yt-dlp:
+within days. If a video won't play, the player says so, shows yt-dlp's own
+explanation and offers **Update yt-dlp**. You can also update it any time:
+open Preferences, find **yt-dlp** (it shows the version you have) and click
+**Update**. If the update changes anything, a video that wouldn't play tries
+again by itself.
+
+Matinee updates the standalone yt-dlp in `~/.local/bin` (section 2c). If
+yours came from moss, or you have none, Matinee downloads yt-dlp's standalone
+build into `~/.local/bin` instead, checks it against the checksums yt-dlp
+publishes, and uses that copy from then on. Nothing outside your home folder
+changes. To update from a terminal instead:
 
 ```sh
 sudo moss sync -u        # if yt-dlp came from moss
@@ -525,8 +536,9 @@ pkg-config --modversion gtk4 libadwaita-1
 Your Rust is too old. Run `sudo moss sync -u`, or install rustup (section 2b).
 
 **Videos don't play.**
-First update yt-dlp (section 7). Then try a video directly in a terminal; the
-output usually explains the problem:
+First update yt-dlp: click **Update yt-dlp** on the player's message, or
+**Update** next to yt-dlp in Preferences (section 7). If that doesn't help, try
+a video directly in a terminal; the output usually explains the problem:
 
 ```sh
 mpv 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
@@ -558,8 +570,9 @@ separate window** in Preferences to use mpv's own window instead.
 **The build stops with "Matinee needs libmpv".**
 Install libmpv's development files: `sudo moss install 'pkgconfig(mpv)'`.
 
-**"Search needs yt-dlp."
-yt-dlp isn't installed or can't be found. Install it (section 2c).
+**"This needs yt-dlp."**
+yt-dlp isn't installed or can't be found. Open Preferences and click
+**Install** next to yt-dlp, or install it yourself (section 2c).
 
 **"Couldn't refresh *channel name*."**
 That channel's feed didn't load. YouTube's feeds occasionally fail for a few
@@ -599,7 +612,9 @@ Run `~/.local/bin/matinee` from a terminal (Konsole) and watch its output.
 ./install.sh --uninstall
 ```
 
-That removes the program, launcher entry and icon. To also delete your channel
+That removes the program, launcher entry and icon. A yt-dlp that Matinee put
+in `~/.local/bin` stays, for other apps to use; delete it with
+`rm ~/.local/bin/yt-dlp` if you don't need it. To also delete your channel
 list and cache:
 
 ```sh
@@ -656,6 +671,7 @@ cargo test           # parser and formatting tests
 | `src/player.rs` | launching mpv in a separate window |
 | `src/store.rs` | the local state file |
 | `src/tools.rs` | finding yt-dlp outside `PATH`, and browsers to borrow a YouTube sign-in from |
+| `src/updater.rs` | updating yt-dlp from Preferences and the player |
 
 The motion design is documented at the top of `data/style.css`.
 
@@ -714,5 +730,6 @@ AV1, which want hardware decoding for smooth playback.
 
 **Preferences** (main menu, or **Ctrl+,**): dark style, card size, Hide
 Shorts, how often to check for new videos, default quality, resuming,
-autoplay, playing in a separate window, a browser's YouTube sign-in, smooth
-scrolling, and the channel list.
+autoplay, playing in a separate window, a browser's YouTube sign-in, the
+yt-dlp version with its **Update** button, smooth scrolling, and the channel
+list.
