@@ -481,7 +481,8 @@ statuspage.floaty image.icon {
   background-color: alpha(white, 0.55);
   border-radius: 1px;
 }
-.watch-controls button.subtitles.active {
+.watch-controls button.subtitles.active,
+.watch-bar button.save.active {
   color: @mt_gold;
 }
 /* The "up next" card: the next video, with a few seconds to say no. */

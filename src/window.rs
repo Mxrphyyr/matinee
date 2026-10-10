@@ -11,7 +11,9 @@ use crate::store::{Store, WindowState};
 use crate::mpris::{self, Mpris, Now};
 use crate::thumbs::{self, Thumbs};
 use crate::watch::{self, Playback, Watch, WatchHooks};
-use crate::{feed, history, icons, perf, player, resolve, search, smooth, style, tools, trending, util, ytdlp, APP_ID};
+use crate::{
+    discover, feed, history, icons, perf, player, resolve, search, smooth, style, tools, trending, util, ytdlp, APP_ID,
+};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
@@ -57,6 +59,10 @@ const REFRESH_CHOICES: [(u32, &str); 4] = [
 enum View {
     Feed,
     Trending,
+    Discover,
+    WatchLater,
+    /// A group of channels, by its id.
+    Group(String),
     Channel(String),
     Search(String),
 }
@@ -66,6 +72,25 @@ enum Filter {
     All,
     Unwatched,
     ThisWeek,
+}
+
+impl Filter {
+    /// How the choice is kept in the state file.
+    fn key(self) -> Option<&'static str> {
+        match self {
+            Filter::All => None,
+            Filter::Unwatched => Some("unwatched"),
+            Filter::ThisWeek => Some("week"),
+        }
+    }
+
+    fn from_key(key: Option<&str>) -> Filter {
+        match key {
+            Some("unwatched") => Filter::Unwatched,
+            Some("week") => Filter::ThisWeek,
+            _ => Filter::All,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +103,9 @@ enum Fetch {
 enum RowTarget {
     All,
     Trending,
+    Discover,
+    WatchLater,
+    Group(String),
     Section,
     Channel(String),
 }
@@ -113,7 +141,10 @@ pub struct Win {
     hero_avatar: adw::Avatar,
     hero_title: gtk::Label,
     hero_sub: gtk::Label,
+    /// Unsubscribe, Edit group… or Shuffle, depending on the view.
     hero_action: gtk::Button,
+    /// "Add to group…", on channel pages.
+    hero_group: gtk::Button,
     filters: gtk::Box,
     filter_buttons: Vec<(Filter, gtk::ToggleButton)>,
     loading_title: gtk::Label,
@@ -129,6 +160,8 @@ pub struct Win {
     /// The list the playing video came from, for playing on through it.
     queue: RefCell<Vec<Video>>,
     queue_pos: Cell<usize>,
+    /// Which set of picks Discover shows; shuffling changes it.
+    discover_seed: Cell<u64>,
 
     thumbs: Rc<Thumbs>,
     store: Rc<RefCell<Store>>,
@@ -216,7 +249,11 @@ impl Win {
         let menu = gio::Menu::new();
         let section = gio::Menu::new();
         section.append(Some("_Import subscriptions…"), Some("win.import"));
+        section.append(Some("_Groups…"), Some("win.groups"));
         section.append(Some("_Hide Shorts"), Some("win.hide-shorts"));
+        menu.append_section(None, &section);
+        let section = gio::Menu::new();
+        section.append(Some("_Mark all as watched"), Some("win.mark-all-watched"));
         menu.append_section(None, &section);
         let section = gio::Menu::new();
         section.append(Some("_Preferences"), Some("win.preferences"));
@@ -287,20 +324,28 @@ impl Win {
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        let hero_group = gtk::Button::builder()
+            .label("Add to group…")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         let hero_top = gtk::Box::new(gtk::Orientation::Horizontal, 16);
         hero_top.append(&hero_avatar);
         hero_top.append(&hero_text);
+        hero_top.append(&hero_group);
         hero_top.append(&hero_action);
 
         let filters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         filters.add_css_class("filters");
+        // The filter in use last time comes back.
+        let saved_filter = Filter::from_key(store.filter.as_deref());
         let mut filter_buttons: Vec<(Filter, gtk::ToggleButton)> = Vec::new();
         for (filter, text) in [(Filter::All, "All"), (Filter::Unwatched, "Unwatched"), (Filter::ThisWeek, "This week")] {
             let button = gtk::ToggleButton::with_label(text);
-            match filter_buttons.first() {
-                Some((_, first)) => button.set_group(Some(first)),
-                None => button.set_active(true),
+            if let Some((_, first)) = filter_buttons.first() {
+                button.set_group(Some(first));
             }
+            button.set_active(filter == saved_filter);
             filters.append(&button);
             filter_buttons.push((filter, button));
         }
@@ -474,6 +519,7 @@ impl Win {
                 hero_title,
                 hero_sub,
                 hero_action,
+                hero_group,
                 filters,
                 filter_buttons,
                 loading_title,
@@ -487,11 +533,12 @@ impl Win {
                 mpris: Mpris::start(mpris_hooks(weak)),
                 queue: RefCell::default(),
                 queue_pos: Cell::new(0),
+                discover_seed: Cell::new(util::now() as u64),
                 thumbs: Thumbs::new(),
                 store: Rc::new(RefCell::new(store)),
                 save_source: Rc::default(),
                 view: RefCell::new(View::Feed),
-                filter: Cell::new(Filter::All),
+                filter: Cell::new(saved_filter),
                 results: RefCell::default(),
                 search_error: RefCell::default(),
                 search_stream: RefCell::default(),
@@ -729,7 +776,13 @@ impl Win {
 
         // ── Greeting, filters and floating buttons ──
         let this = self.clone();
-        self.hero_action.connect_clicked(move |_| this.unsubscribe_current());
+        self.hero_action.connect_clicked(move |_| this.hero_action_clicked());
+        let this = self.clone();
+        self.hero_group.connect_clicked(move |_| {
+            if let View::Channel(id) = this.view.borrow().clone() {
+                this.channel_groups_dialog(&id);
+            }
+        });
         for (filter, button) in &self.filter_buttons {
             let filter = *filter;
             let weak = Rc::downgrade(self);
@@ -737,6 +790,8 @@ impl Win {
                 let Some(win) = weak.upgrade() else { return };
                 if button.is_active() && win.filter.get() != filter {
                     win.filter.set(filter);
+                    win.store.borrow_mut().filter = filter.key().map(str::to_string);
+                    win.save_later();
                     win.render();
                 }
             });
@@ -790,6 +845,26 @@ impl Win {
         self.action("preferences", |w| w.preferences());
         self.action("sign-in", |w| w.sign_in_dialog());
         self.action("toggle-subtitles", |w| w.watch.toggle_subtitles());
+        self.action("groups", |w| w.groups_dialog());
+        self.action("mark-all-watched", |w| w.mark_all_watched());
+        self.action("shuffle", |w| w.shuffle());
+        self.action_with_id("view", |w, name| {
+            let view = match name {
+                "trending" => View::Trending,
+                "discover" => View::Discover,
+                "watch-later" => View::WatchLater,
+                _ => View::Feed,
+            };
+            w.show_view(view);
+        });
+        self.action_with_id("show-group", |w, id| w.show_view(View::Group(id.to_string())));
+        self.action_with_id("edit-group", |w, id| {
+            w.edit_group_dialog(id);
+        });
+        self.action_with_id("add-to-group", |w, id| w.channel_groups_dialog(id));
+        self.action_with_id("toggle-saved", |w, id| {
+            w.toggle_saved(id);
+        });
         self.action("toggle-sidebar", |w| w.split.set_show_sidebar(!w.split.shows_sidebar()));
         self.action("focus-search", |w| {
             w.after_navigation();
@@ -962,6 +1037,9 @@ impl Win {
         let view = match target {
             Some(RowTarget::All) => View::Feed,
             Some(RowTarget::Trending) => View::Trending,
+            Some(RowTarget::Discover) => View::Discover,
+            Some(RowTarget::WatchLater) => View::WatchLater,
+            Some(RowTarget::Group(id)) => View::Group(id),
             Some(RowTarget::Channel(id)) => View::Channel(id),
             _ => return,
         };
@@ -974,6 +1052,9 @@ impl Win {
         let wanted = match &*self.view.borrow() {
             View::Feed => Some(RowTarget::All),
             View::Trending => Some(RowTarget::Trending),
+            View::Discover => Some(RowTarget::Discover),
+            View::WatchLater => Some(RowTarget::WatchLater),
+            View::Group(id) => Some(RowTarget::Group(id.clone())),
             View::Channel(id) => Some(RowTarget::Channel(id.clone())),
             View::Search(_) => None,
         };
@@ -1016,6 +1097,25 @@ impl Win {
         self.channel_list.append(&row);
         targets.push(RowTarget::Trending);
         names.push(String::new());
+
+        let (row, _) = sidebar_row(RowIcon::Named("discover-symbolic"), "Discover");
+        self.channel_list.append(&row);
+        targets.push(RowTarget::Discover);
+        names.push(String::new());
+
+        let (row, badge) = sidebar_row(RowIcon::Named("bookmark-new-symbolic"), "Watch later");
+        self.channel_list.append(&row);
+        targets.push(RowTarget::WatchLater);
+        names.push(String::new());
+        badges.push((RowTarget::WatchLater, badge));
+
+        for group in self.store.borrow().groups.iter() {
+            let (row, badge) = sidebar_row(RowIcon::Named("folder-symbolic"), &group.name);
+            self.channel_list.append(&row);
+            targets.push(RowTarget::Group(group.id.clone()));
+            names.push(String::new());
+            badges.push((RowTarget::Group(group.id.clone()), badge));
+        }
 
         let section = section_row(channels.len(), self.sidebar_filter.collapsed.get());
         self.channel_list.append(&section);
@@ -1082,8 +1182,8 @@ impl Win {
     }
 
     fn update_sidebar_counts(&self) {
+        let st = self.store.borrow();
         let (per_channel, total) = {
-            let st = self.store.borrow();
             let new_ids = self.new_ids.borrow();
             let mut per_channel: HashMap<String, usize> = HashMap::new();
             let mut total = 0;
@@ -1098,12 +1198,17 @@ impl Win {
             (per_channel, total)
         };
         for (target, badge) in self.sidebar_badges.borrow().iter() {
-            let count = match target {
-                RowTarget::Channel(id) => per_channel.get(id).copied().unwrap_or(0),
-                _ => total,
+            let (count, what) = match target {
+                RowTarget::Channel(id) => (per_channel.get(id).copied().unwrap_or(0), "new"),
+                RowTarget::Group(id) => (
+                    st.group(id).map_or(0, |group| group.channels.iter().filter_map(|c| per_channel.get(c)).sum()),
+                    "new",
+                ),
+                RowTarget::WatchLater => (st.watch_later.len(), "saved"),
+                _ => (total, "new"),
             };
             badge.set_label(&count.to_string());
-            badge.set_tooltip_text(Some(&util::count(count, "new video", "new videos")));
+            badge.set_tooltip_text(Some(&util::count(count, &format!("{what} video"), &format!("{what} videos"))));
             badge.set_visible(count > 0);
         }
     }
@@ -1168,6 +1273,13 @@ impl Win {
             let all: Vec<Video> = match &view {
                 View::Feed => st.feed.clone(),
                 View::Trending => trending::rank(&st.feed, now),
+                View::Discover => self.discover_videos(&st, now),
+                View::WatchLater => st.watch_later.clone(),
+                View::Group(id) => {
+                    let members: HashSet<&str> =
+                        st.group(id).map(|g| g.channels.iter().map(String::as_str).collect()).unwrap_or_default();
+                    st.feed.iter().filter(|v| members.contains(v.channel_id.as_str())).cloned().collect()
+                }
                 View::Channel(id) => self.channel_videos(id, &st),
                 View::Search(_) => self.results.borrow().clone(),
             };
@@ -1207,6 +1319,7 @@ impl Win {
         self.note.set_label(match (&view, self.filter.get()) {
             (View::Channel(_), Filter::All) => "Loading this channel's videos…",
             (View::Trending, Filter::All) => "Nothing is trending yet. Check back once your channels post.",
+            (View::Discover, _) => "Nothing left to discover with this filter.",
             (_, Filter::Unwatched) => "You've watched everything here.",
             (_, Filter::ThisWeek) => "Nothing was uploaded here this week.",
             _ => "Nothing to show.",
@@ -1222,6 +1335,38 @@ impl Win {
             }
         }
         self.update_hero(true);
+    }
+
+    /// Discover's picks: from the feed and any older uploads read this
+    /// session, for the current shuffle.
+    fn discover_videos(&self, st: &Store, now: i64) -> Vec<Video> {
+        let mut candidates = st.feed.clone();
+        for older in self.history.borrow().values() {
+            candidates.extend(older.iter().cloned());
+        }
+        discover::pick(&candidates, &st.watched, now, self.discover_seed.get())
+    }
+
+    /// A new set of Discover picks.
+    fn shuffle(self: &Rc<Self>) {
+        self.discover_seed.set(self.discover_seed.get().wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+        if *self.view.borrow() == View::Discover {
+            self.render();
+        } else {
+            self.show_view(View::Discover);
+        }
+    }
+
+    /// Unsubscribe, Edit group… or Shuffle: whatever the hero offers here.
+    fn hero_action_clicked(self: &Rc<Self>) {
+        match self.view.borrow().clone() {
+            View::Channel(_) => self.unsubscribe_current(),
+            View::Group(id) => {
+                self.edit_group_dialog(&id);
+            }
+            View::Discover => self.shuffle(),
+            _ => {}
+        }
     }
 
     /// Puts `items` in the grid: enough for the first screens at once, the
@@ -1409,6 +1554,7 @@ impl Win {
             CardOpts {
                 is_new: self.new_ids.borrow().contains(&video.id),
                 watched: st.watched.contains(&video.id),
+                saved: st.is_saved(&video.id),
                 show_channel: !matches!(*self.view.borrow(), View::Channel(_)),
                 subscribed: st.is_subscribed(&video.channel_id),
                 progress: st.progress.get(&video.id).map_or(0.0, |&[position, duration]| {
@@ -1590,6 +1736,23 @@ impl Win {
                     "Uploads doing unusually well for their channel lately".to_string(),
                     false,
                 ),
+                View::Discover => (
+                    "Discover".to_string(),
+                    "Picks from your channels, shuffled for you".to_string(),
+                    false,
+                ),
+                View::WatchLater => ("Watch later".to_string(), util::count(shown, "video saved", "videos saved"), false),
+                View::Group(id) => {
+                    let group = st.group(id);
+                    let name = group.map_or_else(|| "Group".to_string(), |g| g.name.clone());
+                    let members = group.map_or(0, |g| g.channels.len());
+                    let sub = if members == 0 {
+                        "No channels yet. Add some with Edit group.".to_string()
+                    } else {
+                        format!("{} from {}", util::count(shown, "video", "videos"), util::count(members, "channel", "channels"))
+                    };
+                    (name, sub, false)
+                }
                 View::Channel(id) => {
                     let sub = if self.history_running(id) {
                         format!("{} so far; older ones load as you scroll", util::count(shown, "video", "videos"))
@@ -1603,11 +1766,22 @@ impl Win {
         };
 
         let is_channel = matches!(view, View::Channel(_));
-        self.hero_avatar.set_visible(is_channel);
-        if is_channel {
+        let with_avatar = is_channel || matches!(view, View::Group(_));
+        self.hero_avatar.set_visible(with_avatar);
+        if with_avatar {
             self.hero_avatar.set_text(Some(&title));
         }
-        self.hero_action.set_visible(is_channel);
+        let action = match view {
+            View::Channel(_) => Some("Unsubscribe"),
+            View::Group(_) => Some("Edit group…"),
+            View::Discover => Some("Shuffle"),
+            _ => None,
+        };
+        self.hero_action.set_visible(action.is_some());
+        if let Some(label) = action {
+            self.hero_action.set_label(label);
+        }
+        self.hero_group.set_visible(is_channel);
         self.filters.set_visible(!matches!(view, View::Search(_)));
         self.hero_title.set_label(&title);
         self.hero_sub.set_label(&sub);
@@ -1654,7 +1828,42 @@ impl Win {
                 "This channel hasn't uploaded any videos.".to_string(),
                 false,
             ),
-            View::Feed | View::Trending if no_channels => (
+            View::WatchLater if hide_shorts && !self.store.borrow().watch_later.is_empty() => (
+                "bookmark-new-symbolic",
+                "Your saved videos are Shorts",
+                shorts_hint.to_string(),
+                false,
+            ),
+            View::WatchLater => (
+                "bookmark-new-symbolic",
+                "Nothing saved yet",
+                "Right-click a video and choose Save for later, or use the bookmark button in the player. \
+                 Saved videos wait here until you remove them."
+                    .to_string(),
+                false,
+            ),
+            View::Discover if !no_channels => (
+                "discover-symbolic",
+                "Nothing to discover yet",
+                "Discover picks from your channels' uploads you haven't watched. There's nothing left to pick \
+                 from right now."
+                    .to_string(),
+                false,
+            ),
+            View::Group(id) => {
+                let members = self.store.borrow().group(id).map_or(0, |g| g.channels.len());
+                if members == 0 {
+                    ("folder-symbolic", "This group is empty", "Add channels to it with Edit group.".to_string(), false)
+                } else {
+                    (
+                        "folder-symbolic",
+                        "Nothing here",
+                        "No recent uploads from this group's channels.".to_string(),
+                        false,
+                    )
+                }
+            }
+            View::Feed | View::Trending | View::Discover if no_channels => (
                 "video-x-generic-symbolic",
                 "Build your feed",
                 "Bring your subscriptions over from Google Takeout, NewPipe or FreeTube, \
@@ -1662,13 +1871,13 @@ impl Win {
                     .to_string(),
                 true,
             ),
-            View::Feed | View::Trending if feed_empty => (
+            View::Feed | View::Trending | View::Discover if feed_empty => (
                 "network-offline-symbolic",
                 "No videos yet",
                 "Your channels couldn't be loaded. Check your connection, then refresh.".to_string(),
                 false,
             ),
-            View::Feed | View::Trending => (
+            View::Feed | View::Trending | View::Discover => (
                 "video-x-generic-symbolic",
                 "Nothing to show",
                 format!("Every recent upload is a Short. {shorts_hint}"),
@@ -2170,6 +2379,9 @@ impl Win {
                 let mut st = this.store.borrow_mut();
                 st.channels.retain(|c| c.id != id);
                 st.feed.retain(|v| v.channel_id != id);
+                for group in &mut st.groups {
+                    group.channels.retain(|c| *c != id);
+                }
             }
             this.save_later();
             *this.view.borrow_mut() = View::Feed;
@@ -2362,6 +2574,381 @@ impl Win {
         if let Some(card) = self.bound_card(&video.id) {
             card.set_progress(if unfinished { position / duration } else { 0.0 });
         }
+    }
+
+    // ── Watch later ────────────────────────────────────────────────────
+
+    /// Saves a video for later, or removes it again. Returns whether it's
+    /// saved now.
+    fn toggle_saved(self: &Rc<Self>, id: &str) -> bool {
+        let Some(video) = self.find_video(id) else { return false };
+        let saved = self.store.borrow_mut().toggle_saved(&video);
+        self.save_later();
+        if let Some(card) = self.bound_card(id) {
+            card.set_saved(saved);
+        }
+        self.update_sidebar_counts();
+        if *self.view.borrow() == View::WatchLater && !saved {
+            // Leaves the list in place, without reshuffling the rest.
+            let position = self.shown.borrow().iter().position(|v| v.id == id);
+            if let Some(position) = position {
+                self.shown.borrow_mut().remove(position);
+                if (position as u32) < self.model.n_items() {
+                    self.model.remove(position as u32);
+                }
+            }
+            if self.shown.borrow().is_empty() {
+                self.render();
+            } else {
+                self.update_hero(false);
+            }
+        }
+        self.toast(if saved { "Saved for later" } else { "Removed from Watch later" });
+        saved
+    }
+
+    /// Marks everything on screen as watched, after asking.
+    fn mark_all_watched(self: &Rc<Self>) {
+        let count = self.shown.borrow().len();
+        if count == 0 {
+            self.toast("Nothing here to mark");
+            return;
+        }
+        let where_ = match self.view.borrow().clone() {
+            View::Feed => "All videos".to_string(),
+            View::Trending => "Trending".to_string(),
+            View::Discover => "Discover".to_string(),
+            View::WatchLater => "Watch later".to_string(),
+            View::Group(id) => self.store.borrow().group(&id).map_or_else(|| "this group".to_string(), |g| g.name.clone()),
+            View::Channel(id) => self.store.borrow().channel_name(&id).unwrap_or_else(|| "this channel".to_string()),
+            View::Search(query) => format!("results for “{query}”"),
+        };
+        let dialog = adw::AlertDialog::new(
+            Some(&format!("Mark {} as watched?", util::count(count, "video", "videos"))),
+            Some(&format!("Everything shown in {where_} right now, with the current filter.")),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("mark", "Mark as watched")]);
+        dialog.set_response_appearance("mark", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("mark"));
+        dialog.set_close_response("cancel");
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if dialog.choose_future(Some(&this.window)).await.as_str() != "mark" {
+                return;
+            }
+            let ids: Vec<String> = this.shown.borrow().iter().map(|v| v.id.clone()).collect();
+            {
+                let mut st = this.store.borrow_mut();
+                let mut new_ids = this.new_ids.borrow_mut();
+                for id in &ids {
+                    st.watched.insert(id.clone());
+                    new_ids.remove(id);
+                }
+            }
+            this.save_later();
+            for id in &ids {
+                if let Some(card) = this.bound_card(id) {
+                    card.set_watched(true);
+                }
+            }
+            this.update_sidebar_counts();
+            if this.filter.get() == Filter::Unwatched {
+                this.render();
+            } else {
+                this.update_hero(false);
+            }
+            this.toast(&format!("Marked {} as watched", util::count(ids.len(), "video", "videos")));
+        });
+    }
+
+    // ── Groups ─────────────────────────────────────────────────────────
+
+    /// Puts a channel in a group or takes it out.
+    fn set_in_group(self: &Rc<Self>, group_id: &str, channel_id: &str, member: bool) {
+        {
+            let mut st = self.store.borrow_mut();
+            let Some(group) = st.group_mut(group_id) else { return };
+            group.channels.retain(|c| c != channel_id);
+            if member {
+                group.channels.push(channel_id.to_string());
+            }
+        }
+        self.save_later();
+        self.update_sidebar_counts();
+        if *self.view.borrow() == View::Group(group_id.to_string()) {
+            self.render();
+        }
+    }
+
+    fn rename_group(self: &Rc<Self>, group_id: &str, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut st = self.store.borrow_mut();
+            match st.group_mut(group_id) {
+                Some(group) if group.name != name => {
+                    group.name = name.to_string();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.save_later();
+            self.rebuild_sidebar();
+            if *self.view.borrow() == View::Group(group_id.to_string()) {
+                self.update_hero(false);
+            }
+        }
+    }
+
+    fn delete_group(self: &Rc<Self>, group_id: &str) {
+        self.store.borrow_mut().groups.retain(|g| g.id != group_id);
+        self.save_later();
+        if *self.view.borrow() == View::Group(group_id.to_string()) {
+            *self.view.borrow_mut() = View::Feed;
+            self.render();
+        }
+        self.rebuild_sidebar();
+    }
+
+    /// Makes a group, shows it in the sidebar, and returns its id.
+    fn create_group(self: &Rc<Self>, name: &str) -> String {
+        let id = self.store.borrow_mut().add_group(name);
+        self.save_later();
+        self.rebuild_sidebar();
+        id
+    }
+
+    /// Make, rename, delete groups, and choose each one's channels.
+    fn groups_dialog(self: &Rc<Self>) {
+        let list = gtk::ListBox::new();
+        list.add_css_class("boxed-list");
+        list.set_selection_mode(gtk::SelectionMode::None);
+        let none = gtk::Label::new(Some("No groups yet. Name one below to start."));
+        none.add_css_class("dim-label");
+        none.set_margin_top(12);
+        none.set_margin_bottom(12);
+        let new_name = adw::EntryRow::builder().title("New group").show_apply_button(true).build();
+        let new_list = gtk::ListBox::new();
+        new_list.add_css_class("boxed-list");
+        new_list.set_selection_mode(gtk::SelectionMode::None);
+        new_list.append(&new_name);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        content.set_margin_top(12);
+        content.set_margin_bottom(24);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        content.append(&none);
+        content.append(&list);
+        content.append(&new_list);
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .child(&content)
+            .build();
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::new());
+        view.set_content(Some(&scroller));
+        let dialog = adw::Dialog::builder().title("Groups").content_width(480).content_height(600).child(&view).build();
+
+        // The rows are rebuilt whenever a group changes. The rows reach the
+        // rebuilder through a slot (weakly, so nothing keeps itself alive).
+        let fill_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let this = self.clone();
+        let (list_for_fill, none_for_fill, slot_for_rows) = (list.clone(), none.clone(), Rc::downgrade(&fill_slot));
+        let fill: Rc<dyn Fn()> = Rc::new(move || {
+            list_for_fill.remove_all();
+            let groups = this.store.borrow().groups.clone();
+            none_for_fill.set_visible(groups.is_empty());
+            list_for_fill.set_visible(!groups.is_empty());
+            for group in groups {
+                let row = adw::ActionRow::builder()
+                    .title(&group.name)
+                    .use_markup(false)
+                    .subtitle(util::count(group.channels.len(), "channel", "channels"))
+                    .activatable(true)
+                    .build();
+                row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                let remove = gtk::Button::from_icon_name(&icons::get("edit-delete-symbolic"));
+                remove.add_css_class("flat");
+                remove.set_valign(gtk::Align::Center);
+                remove.set_tooltip_text(Some("Delete this group"));
+                row.add_suffix(&remove);
+                let (win, id, slot) = (this.clone(), group.id.clone(), slot_for_rows.clone());
+                row.connect_activated(move |_| {
+                    if let Some(edit) = win.edit_group_dialog(&id) {
+                        let slot = slot.clone();
+                        edit.connect_closed(move |_| refill(&slot));
+                    }
+                });
+                let (win, id, name, slot) = (this.clone(), group.id.clone(), group.name.clone(), slot_for_rows.clone());
+                remove.connect_clicked(move |_| {
+                    let confirm = adw::AlertDialog::new(
+                        Some(&format!("Delete “{name}”?")),
+                        Some("Its channels stay subscribed; only the group goes."),
+                    );
+                    confirm.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+                    confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                    confirm.set_default_response(Some("cancel"));
+                    confirm.set_close_response("cancel");
+                    let (win, id, slot) = (win.clone(), id.clone(), slot.clone());
+                    glib::spawn_future_local(async move {
+                        if confirm.choose_future(Some(&win.window)).await.as_str() == "delete" {
+                            win.delete_group(&id);
+                            refill(&slot);
+                        }
+                    });
+                });
+                list_for_fill.append(&row);
+            }
+        });
+        *fill_slot.borrow_mut() = Some(fill.clone());
+        fill();
+        let (this, slot) = (self.clone(), Rc::downgrade(&fill_slot));
+        new_name.connect_apply(move |entry| {
+            let name = entry.text().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            entry.set_text("");
+            let id = this.create_group(&name);
+            refill(&slot);
+            if let Some(edit) = this.edit_group_dialog(&id) {
+                let slot = slot.clone();
+                edit.connect_closed(move |_| refill(&slot));
+            }
+        });
+        // The slot lives as long as the dialog does.
+        dialog.connect_closed(move |_| drop(fill_slot.borrow_mut().take()));
+        dialog.present(Some(&self.window));
+    }
+
+    /// One group's name and channels. Changes apply as they're made.
+    fn edit_group_dialog(self: &Rc<Self>, group_id: &str) -> Option<adw::Dialog> {
+        let (name, members, mut channels) = {
+            let st = self.store.borrow();
+            let group = st.group(group_id)?;
+            let members: HashSet<String> = group.channels.iter().cloned().collect();
+            (group.name.clone(), members, st.channels.clone())
+        };
+        channels.sort_by_cached_key(|c| c.name.to_lowercase());
+        let name_row = adw::EntryRow::builder().title("Name").text(&name).build();
+        let name_list = gtk::ListBox::new();
+        name_list.add_css_class("boxed-list");
+        name_list.set_selection_mode(gtk::SelectionMode::None);
+        name_list.append(&name_row);
+        let filter = gtk::SearchEntry::builder().placeholder_text("Filter channels").build();
+        let list = gtk::ListBox::new();
+        list.add_css_class("boxed-list");
+        list.set_selection_mode(gtk::SelectionMode::None);
+        let names: Rc<Vec<String>> = Rc::new(channels.iter().map(|c| c.name.to_lowercase()).collect());
+        for channel in &channels {
+            let check = gtk::CheckButton::new();
+            check.set_active(members.contains(&channel.id));
+            let row = adw::ActionRow::builder().title(&channel.name).use_markup(false).activatable_widget(&check).build();
+            row.add_prefix(&check);
+            let (this, group_id, channel_id) = (self.clone(), group_id.to_string(), channel.id.clone());
+            check.connect_toggled(move |check| this.set_in_group(&group_id, &channel_id, check.is_active()));
+            list.append(&row);
+        }
+        let query = Rc::new(RefCell::new(String::new()));
+        let (names_for_filter, query_for_filter) = (names.clone(), query.clone());
+        list.set_filter_func(move |row| {
+            let query = query_for_filter.borrow();
+            query.is_empty() || names_for_filter.get(row.index() as usize).is_some_and(|name| name.contains(query.as_str()))
+        });
+        let (list_for_filter, query_for_entry) = (list.clone(), query.clone());
+        filter.connect_search_changed(move |entry| {
+            *query_for_entry.borrow_mut() = entry.text().trim().to_lowercase();
+            list_for_filter.invalidate_filter();
+        });
+        let heading = gtk::Label::new(Some("Channels in this group"));
+        heading.add_css_class("heading");
+        heading.set_xalign(0.0);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(24);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        content.append(&name_list);
+        content.append(&heading);
+        content.append(&filter);
+        content.append(&list);
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&content)
+            .build();
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::new());
+        view.set_content(Some(&scroller));
+        let dialog = adw::Dialog::builder().title(&name).content_width(480).content_height(680).child(&view).build();
+        // The name applies when the dialog closes, since the sidebar is rebuilt for it.
+        let (this, group_id) = (self.clone(), group_id.to_string());
+        dialog.connect_closed(move |_| this.rename_group(&group_id, &name_row.text()));
+        dialog.present(Some(&self.window));
+        Some(dialog)
+    }
+
+    /// Which groups a channel is in, from its page.
+    fn channel_groups_dialog(self: &Rc<Self>, channel_id: &str) {
+        let (channel_name, groups) = {
+            let st = self.store.borrow();
+            (st.channel_name(channel_id).unwrap_or_default(), st.groups.clone())
+        };
+        let list = gtk::ListBox::new();
+        list.add_css_class("boxed-list");
+        list.set_selection_mode(gtk::SelectionMode::None);
+        for group in &groups {
+            let check = gtk::CheckButton::new();
+            check.set_active(group.channels.iter().any(|c| c == channel_id));
+            let row = adw::ActionRow::builder().title(&group.name).use_markup(false).activatable_widget(&check).build();
+            row.add_prefix(&check);
+            let (this, group_id, channel_id) = (self.clone(), group.id.clone(), channel_id.to_string());
+            check.connect_toggled(move |check| this.set_in_group(&group_id, &channel_id, check.is_active()));
+            list.append(&row);
+        }
+        let new_name = adw::EntryRow::builder().title("New group").show_apply_button(true).build();
+        let new_list = gtk::ListBox::new();
+        new_list.add_css_class("boxed-list");
+        new_list.set_selection_mode(gtk::SelectionMode::None);
+        new_list.append(&new_name);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        content.set_margin_top(12);
+        content.set_margin_bottom(24);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        if groups.is_empty() {
+            let none = gtk::Label::new(Some("No groups yet. Name one below to start."));
+            none.add_css_class("dim-label");
+            content.append(&none);
+        } else {
+            content.append(&list);
+        }
+        content.append(&new_list);
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::new());
+        view.set_content(Some(&content));
+        let dialog = adw::Dialog::builder()
+            .title(format!("Groups for {channel_name}"))
+            .content_width(440)
+            .child(&view)
+            .build();
+        let (this, channel_id, dialog_for_apply) = (self.clone(), channel_id.to_string(), dialog.clone());
+        new_name.connect_apply(move |entry| {
+            let name = entry.text().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            let id = this.create_group(&name);
+            this.set_in_group(&id, &channel_id, true);
+            this.toast(&format!("Added to “{name}”"));
+            dialog_for_apply.close();
+        });
+        dialog.present(Some(&self.window));
     }
 
     fn copy_link(&self, id: &str) {
@@ -2633,6 +3220,14 @@ impl Win {
     }
 }
 
+/// Runs the groups dialog's row builder, if the dialog is still open.
+fn refill(slot: &Weak<RefCell<Option<Rc<dyn Fn()>>>>) {
+    let fill = slot.upgrade().and_then(|slot| slot.borrow().clone());
+    if let Some(fill) = fill {
+        fill();
+    }
+}
+
 fn watch_hooks(weak: &Weak<Win>) -> WatchHooks {
     let (started, stopped, pop_out, volume, quality, sign_in) =
         (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
@@ -2721,6 +3316,14 @@ fn watch_hooks(weak: &Weak<Win>) -> WatchHooks {
                     win.save_later();
                 }
             }
+        }),
+        toggle_saved: Box::new({
+            let weak = weak.clone();
+            move |video: &Video| weak.upgrade().is_some_and(|win| win.toggle_saved(&video.id))
+        }),
+        is_saved: Box::new({
+            let weak = weak.clone();
+            move |id: &str| weak.upgrade().is_some_and(|win| win.store.borrow().is_saved(id))
         }),
     }
 }

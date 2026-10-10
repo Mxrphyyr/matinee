@@ -6,6 +6,15 @@ pub struct Channel {
     pub name: String,
 }
 
+/// A named set of channels with a feed of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Video {
     pub id: String,

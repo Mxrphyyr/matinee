@@ -1,6 +1,7 @@
 //! Matinee: a private, ad-free GTK client for following YouTube channels.
 
 mod card;
+mod discover;
 mod feed;
 mod history;
 mod icons;

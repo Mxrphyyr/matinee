@@ -1,7 +1,7 @@
 //! Everything Matinee remembers lives in one JSON file on this machine:
 //! ~/.local/share/matinee/state.json. Nothing is synced anywhere.
 
-use crate::model::{Channel, Video};
+use crate::model::{Channel, Group, Video};
 use gtk::glib;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -65,6 +65,15 @@ pub struct Store {
     /// Show subtitles when a video has them.
     #[serde(default)]
     pub subtitles: bool,
+    /// Videos saved to watch later, newest saved first.
+    #[serde(default)]
+    pub watch_later: Vec<Video>,
+    /// Named sets of channels, each with a feed of its own.
+    #[serde(default)]
+    pub groups: Vec<Group>,
+    /// The feed filter in use: "unwatched", "week", or nothing for all.
+    #[serde(default)]
+    pub filter: Option<String>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -130,6 +139,37 @@ impl Store {
 
     pub fn channel_name(&self, channel_id: &str) -> Option<String> {
         self.channels.iter().find(|c| c.id == channel_id).map(|c| c.name.clone())
+    }
+
+    pub fn is_saved(&self, video_id: &str) -> bool {
+        self.watch_later.iter().any(|v| v.id == video_id)
+    }
+
+    /// Saves a video to watch later, or removes it if it's there. Returns
+    /// whether it's saved now.
+    pub fn toggle_saved(&mut self, video: &Video) -> bool {
+        if let Some(index) = self.watch_later.iter().position(|v| v.id == video.id) {
+            self.watch_later.remove(index);
+            false
+        } else {
+            self.watch_later.insert(0, video.clone());
+            true
+        }
+    }
+
+    pub fn group(&self, id: &str) -> Option<&Group> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    pub fn group_mut(&mut self, id: &str) -> Option<&mut Group> {
+        self.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    /// Makes a group with this name and returns its id.
+    pub fn add_group(&mut self, name: &str) -> String {
+        let id = format!("g{}-{}", crate::util::now(), self.groups.len());
+        self.groups.push(Group { id: id.clone(), name: name.trim().to_string(), channels: Vec::new() });
+        id
     }
 }
 

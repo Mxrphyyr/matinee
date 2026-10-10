@@ -258,8 +258,9 @@ You can also subscribe from search results: right-click a video and choose
 
 ### The window
 
-- **Sidebar:** *All videos*, then your channels A–Z. A gold number shows how
-  many new uploads a channel has.
+- **Sidebar:** *All videos*, *Trending*, *Discover*, *Watch later*, your
+  groups, then your channels A–Z. A gold number shows how many new uploads
+  a channel or group has, and how many videos are saved for later.
 - **Header:** a greeting with how many videos are new since your last visit,
   or the channel name and an **Unsubscribe** button when viewing one channel.
 - **Filters:** *All*, *Unwatched* or *This week*, right under the greeting.
@@ -273,7 +274,7 @@ You can also subscribe from search results: right-click a video and choose
 | Action | Result |
 |---|---|
 | Click a video | Plays it in the window and marks it watched |
-| Right-click, or long-press on a touchscreen | Play, Play in separate window, Mark as watched/unwatched, Copy link, Open in browser, Go to channel or Subscribe |
+| Right-click, or long-press on a touchscreen | Play, Play in separate window, Mark as watched/unwatched, Save for later, Copy link, Open in browser, Go to channel or Subscribe |
 | Gold **Show N new videos** button | Appears when a background check finds uploads; click to see them |
 | Gold arrow, bottom-right | Glides back to the top |
 
@@ -304,6 +305,7 @@ move the mouse.
 | ↑ / ↓ | Volume |
 | M | Mute |
 | C | Subtitles on or off |
+| S | Save for later, or remove again |
 | N / Shift+N | Next / previous video in the list you came from |
 | Page Down / Page Up | Next / previous chapter |
 | P | Picture in picture |
@@ -368,7 +370,9 @@ browser…** instead (see [section 7](#7-keeping-playback-working)).
 ### Main menu
 
 - **Import subscriptions…**
+- **Groups…:** make and edit groups of channels (see the end of this page).
 - **Hide Shorts:** removes Shorts from the feed, channel pages and search.
+- **Mark all as watched:** everything shown right now, after asking.
 - **Preferences:** dark style, card size, how often to check for new videos,
   video quality, playing in a separate window, a browser's YouTube sign-in,
   and more (see the end of this page).
@@ -640,6 +644,7 @@ cargo test           # parser and formatting tests
 | `src/history.rs` | a channel's full upload history, a page at a time |
 | `src/perf.rs` | the `MATINEE_PERF=1` timing output |
 | `src/trending.rs` | the Trending ranking |
+| `src/discover.rs` | Discover's picks, from your own data |
 | `src/mpv.rs` | the libmpv binding: playback engine and OpenGL drawing |
 | `data/style.css` | all styling and motion |
 | `src/style.rs` | the light and dark palettes |
@@ -659,7 +664,7 @@ The motion design is documented at the top of `data/style.css`.
 GPL-3.0-or-later.
 
 
-## Channels, Trending and preferences
+## Channels, Trending, Discover, groups and preferences
 
 **The channel list** on the left is a drawer. Hide or show it with the button
 at the top left of the feed or with **F9**; Matinee remembers your choice. On a
@@ -680,6 +685,26 @@ channel's usual views at the same age ranks high, so a small channel's
 breakout can sit above a huge channel's ordinary upload. It only uses view
 counts Matinee already has, so it sends nothing anywhere. (YouTube retired its
 public Trending page in 2025, so there is no global list to show.)
+
+**Discover** picks forty videos at random from your channels' uploads you
+haven't watched, leaning toward the channels you watch most and uploads doing
+well for their channel, at most two per channel. **Shuffle** picks again. It
+works only from what Matinee already has, so nothing is sent anywhere and no
+account is involved.
+
+**Watch later.** Right-click a video and choose **Save for later**, or press
+the bookmark button in the player (or **S**). Saved videos wait in *Watch
+later* until you remove them, search results included.
+
+**Groups.** *Groups…* in the main menu makes groups of channels; each one
+appears in the sidebar with a feed of its own and a count of new uploads. On
+a channel's page, **Add to group…** puts that channel in a group (or starts a
+new one), and on a group's page **Edit group…** changes its name and
+channels.
+
+**Mark all as watched** (main menu) marks everything shown right now, with
+the current filter, after asking. The *All*, *Unwatched* and *This week*
+choice is remembered between launches.
 
 **Video quality.** The button beside the speed shows what's playing (720p,
 1080p, 4K) and lets you pick another; the video reloads from the same moment.

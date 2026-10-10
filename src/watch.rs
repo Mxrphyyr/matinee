@@ -50,6 +50,9 @@ pub struct WatchHooks {
     pub thumbnail: Box<dyn Fn(&str, Box<dyn FnOnce(&gdk::Texture)>)>,
     /// Subtitles were turned on or off in the player; remember it.
     pub subtitles_changed: Box<dyn Fn(bool)>,
+    /// Save this video for later, or remove it; says whether it's saved now.
+    pub toggle_saved: Box<dyn Fn(&Video) -> bool>,
+    pub is_saved: Box<dyn Fn(&str) -> bool>,
 }
 
 /// How playback is going, for the desktop's media controls.
@@ -150,6 +153,8 @@ pub struct Watch {
     bottom: gtk::Revealer,
     title: gtk::Label,
     channel: gtk::Label,
+    /// "Save for later", in the top bar.
+    save: gtk::Button,
     seek: gtk::Scale,
     time: gtk::Label,
     /// The current chapter's name, beside the clock.
@@ -292,10 +297,13 @@ impl Watch {
         pop_out.add_css_class("flat");
         pop_out.set_valign(gtk::Align::Center);
         pop_out.set_tooltip_text(Some("Continue in a separate mpv window"));
+        let save = icon_button("bookmark-new-symbolic", "Save for later (S)");
+        save.add_css_class("save");
         let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         top_bar.add_css_class("watch-bar");
         top_bar.append(&back);
         top_bar.append(&titles);
+        top_bar.append(&save);
         top_bar.append(&pop_out);
         let top = gtk::Revealer::builder()
             .transition_type(gtk::RevealerTransitionType::Crossfade)
@@ -477,6 +485,7 @@ impl Watch {
             bottom,
             title,
             channel,
+            save,
             seek,
             time,
             chapter,
@@ -574,6 +583,7 @@ impl Watch {
         on(&self.choose_browser, |w| (w.hooks.choose_sign_in)());
         on(pop_out, |w| w.pop_out());
         on(&self.subtitles_button, |w| w.toggle_subtitles());
+        on(&self.save, |w| w.toggle_saved());
         on(play_now, |w| w.play_next_now());
         on(cancel_next, |w| w.cancel_autoplay());
 
@@ -700,6 +710,10 @@ impl Watch {
                     watch.toggle_subtitles();
                     true
                 }
+                gdk::Key::s | gdk::Key::S => {
+                    watch.toggle_saved();
+                    true
+                }
                 gdk::Key::n => {
                     watch.play_next_now();
                     true
@@ -794,6 +808,7 @@ impl Watch {
         self.page.set_title(&video.title);
         self.title.set_label(&video.title);
         self.channel.set_label(&video.channel_name);
+        self.show_saved((self.hooks.is_saved)(&video.id));
         self.poster.set_visible(true);
         self.poster.remove_css_class("gone");
         self.main.area.remove_css_class("playing");
@@ -1716,6 +1731,25 @@ impl Watch {
         if let Some(mpv) = self.mpv() {
             mpv.command_async(&["add", "chapter", &step.to_string()]);
         }
+    }
+
+    // ── Watch later ────────────────────────────────────────────────────
+
+    fn toggle_saved(&self) {
+        let video = self.video.borrow().clone();
+        if let Some(video) = video {
+            let saved = (self.hooks.toggle_saved)(&video);
+            self.show_saved(saved);
+        }
+    }
+
+    fn show_saved(&self, saved: bool) {
+        if saved {
+            self.save.add_css_class("active");
+        } else {
+            self.save.remove_css_class("active");
+        }
+        self.save.set_tooltip_text(Some(if saved { "Saved for later (S)" } else { "Save for later (S)" }));
     }
 
     // ── Subtitles ──────────────────────────────────────────────────────

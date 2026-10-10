@@ -66,7 +66,7 @@ features (`gtk` v4_12, `adw` v1_5). It tests, packages
 `matinee-X.Y.Z-x86_64-linux.tar.gz` plus `.sha256`, and when the version in
 Cargo.toml has no release yet, publishes one with the notes in
 `.github/release-notes.md` plus GitHub's generated notes. Published so far:
-v0.3.0, v0.3.1, v0.3.2, v0.4.0 and v0.5.0. The owner's gh login has the `workflow` scope needed to
+v0.3.0, v0.3.1, v0.3.2, v0.4.0, v0.5.0 and v0.6.0. The owner's gh login has the `workflow` scope needed to
 push workflow changes. A release archive installs with its own `./install.sh`,
 which detects the prebuilt binary and checks libraries before installing.
 
@@ -86,6 +86,7 @@ which detects the prebuilt binary and checks libraries before installing.
 | `ytdlp.rs` | runs yt-dlp for a list and streams its entries as they arrive; optional page gating (reading pauses until `more`) |
 | `history.rs` | a channel's older uploads: `ytdlp` with 60 per page, `--sleep-requests 1` |
 | `trending.rs` | Trending ranking (subscriptions only) |
+| `discover.rs` | Discover's weighted random picks from the owner's own data (seeded, so Shuffle repeats or changes the set) |
 | `search.rs` | yt-dlp search through `ytdlp` (results show as they come) and flat-entry parsing |
 | `perf.rs` | the `MATINEE_PERF=1` diagnostics: marks, timed spans, frame report |
 | `resolve.rs` | channel ids from links and @handles; Takeout, NewPipe, FreeTube and OPML import |
@@ -187,6 +188,21 @@ which detects the prebuilt binary and checks libraries before installing.
   lull); a bot check with no results retries with the sign-in.
 - **State.** Saves are batched (700 ms) and forced on close. New settings use
   `Option` or negative booleans (`no_resume`) so older state files load.
+- **Browsing features (0.6.0).** Views: Feed, Trending, Discover, WatchLater,
+  Group(id), Channel(id), Search. The sidebar's fixed rows are All, Trending,
+  Discover, Watch later (badge = saved count), one row per group (badge =
+  new uploads in it), then the foldable Channels section. `store.watch_later`
+  holds whole `Video`s (search results persist); `store.groups` are
+  `Group { id, name, channels }` with ids like `g<time>-<n>`; `store.filter`
+  remembers All/Unwatched/This week. Discover = `discover::pick` over the
+  feed plus any older uploads read this session, weight = freshness ×
+  (1 + 2·affinity) × doing-well, max two per channel, 40 picks; the hero
+  action is Shuffle. Group dialogs are `adw::Dialog`s: a manager (main menu
+  Groups…), an editor (name entry + channel checklist; the name applies on
+  close since the sidebar is rebuilt) and a per-channel membership dialog
+  (Add to group… on channel pages). Window actions for tests: `view`
+  (feed/trending/discover/watch-later), `shuffle`, `toggle-saved`,
+  `show-group`, `edit-group`, `add-to-group`, `groups`, `mark-all-watched`.
 
 ## Testing
 

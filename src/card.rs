@@ -28,6 +28,7 @@ pub fn note_scroll() {
 pub struct CardOpts {
     pub is_new: bool,
     pub watched: bool,
+    pub saved: bool,
     pub show_channel: bool,
     pub subscribed: bool,
     pub progress: f64,
@@ -38,6 +39,7 @@ struct Bound {
     channel_id: String,
     channel_name: String,
     watched: bool,
+    saved: bool,
     subscribed: bool,
 }
 
@@ -262,6 +264,7 @@ impl Card {
             channel_id: video.channel_id.clone(),
             channel_name: video.channel_name.clone(),
             watched: opts.watched,
+            saved: opts.saved,
             subscribed: opts.subscribed,
         });
     }
@@ -391,6 +394,12 @@ impl Card {
         }
     }
 
+    pub fn set_saved(&self, saved: bool) {
+        if let Some(bound) = self.bound.borrow_mut().as_mut() {
+            bound.saved = saved;
+        }
+    }
+
     pub fn set_progress(&self, fraction: f64) {
         self.thumb.set_progress(fraction);
     }
@@ -444,6 +453,8 @@ impl Card {
         watch.append_item(&item("Play in separate window", "win.play-external", &bound.id));
         let toggle = if bound.watched { "Mark as unwatched" } else { "Mark as watched" };
         watch.append_item(&item(toggle, "win.toggle-watched", &bound.id));
+        let save = if bound.saved { "Remove from Watch later" } else { "Save for later" };
+        watch.append_item(&item(save, "win.toggle-saved", &bound.id));
         menu.append_section(None, &watch);
 
         let share = gio::Menu::new();

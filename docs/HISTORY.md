@@ -195,3 +195,23 @@ the reasons.
   fixed by recording the video first.
 - The owner tried all four on the real desktop ("everything works") and
   0.5.0 was released. Next: 0.6.0 (browsing features).
+
+## 0.6.0: browsing
+
+- Discover: forty weighted random picks from the owner's own feed (and any
+  older uploads read this session): fresher uploads, channels they watch
+  more (counted from watched marks) and uploads with more views than usual
+  for their channel weigh more; at most two per channel; watched videos left
+  out. Seeded, so Shuffle gives a new set. Nothing is sent anywhere, by
+  design: the owner asked for suggestions "away from Google's telemetry".
+- Watch later, kept locally with whole video records so search results
+  survive; a bookmark button in the player (S) and a context-menu item.
+- Channel groups with their own feeds and new-upload badges; a manager
+  dialog, an editor with a filterable checklist of 271 channels, and an
+  "Add to group…" button on channel pages.
+- Mark all as watched (asks first, names the view), and the All/Unwatched/
+  This week filter remembered between launches.
+- Found in the hidden desktop: a saved Short with Hide Shorts on showed
+  "Nothing saved yet"; the empty state now says the saved videos are Shorts.
+- The owner tried everything on the real desktop ("everything works") and
+  0.6.0 was released, completing the three rounds planned on 2026-10-10.
