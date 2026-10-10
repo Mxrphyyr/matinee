@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b2a49"/>
+      <stop offset="1" stop-color="#1c1421"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffd98a" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#f2b544" stop-opacity="0.12"/>
+    </linearGradient>
+    <radialGradient id="lens" cx="0.38" cy="0.36" r="0.7">
+      <stop offset="0" stop-color="#fff6dd"/>
+      <stop offset="0.55" stop-color="#f6c869"/>
+      <stop offset="1" stop-color="#d9931c"/>
+    </radialGradient>
+  </defs>
+  <rect x="8" y="10" width="112" height="108" rx="26" fill="#140e18"/>
+  <rect x="8" y="8" width="112" height="106" rx="26" fill="url(#body)"/>
+  <path d="M36 61 L106 30 Q113 62 106 94 L36 67 Z" fill="url(#beam)"/>
+  <path d="M106 30 Q113 62 106 94" fill="none" stroke="#f3ebdd" stroke-opacity="0.55" stroke-width="2.5" stroke-linecap="round"/>
+  <circle cx="34" cy="64" r="15" fill="url(#lens)"/>
+  <circle cx="34" cy="64" r="9.5" fill="none" stroke="#a8670a" stroke-opacity="0.55" stroke-width="2"/>
+  <path d="M26 58 A10 10 0 0 1 33 54" fill="none" stroke="#ffffff" stroke-opacity="0.8" stroke-width="2.4" stroke-linecap="round"/>
+</svg>

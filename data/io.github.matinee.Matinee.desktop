@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Matinee
+Comment=Follow YouTube channels without ads, tracking or an account
+Exec=matinee
+Icon=io.github.matinee.Matinee
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;Network;GTK;
+Keywords=youtube;video;subscriptions;feed;channels;
+StartupNotify=true

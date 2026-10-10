@@ -1,0 +1,614 @@
+/* Matinee
+ *
+ * Colors are tokens defined at runtime in src/style.rs (light and dark sets):
+ *   @mt_gold      marquee gold: new videos, selection, focus. Nothing else is gold.
+ *   @mt_gold_ink  text on gold
+ *   @mt_gold_text gold for text and outlines (darker in light mode)
+ *   @mt_dim       secondary text
+ *   @mt_seat      placeholder surfaces
+ *   @mt_velvet    deep plum for overlays on thumbnails
+ *
+ * Motion
+ *   The orchestrated moment: when a feed appears, its first screen of cards
+ *   rises in a diagonal wave and each thumbnail fades up out of the dark.
+ *   Thumbnail fades, hover zoom and watched dimming are drawn by the
+ *   thumbnail itself (src/thumb.rs), so they repaint without relayout or
+ *   filter passes, which keeps them smooth. Everything else answers the
+ *   pointer, and GTK turns all of it off when the system asks for reduced
+ *   motion.
+ */
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+
+.brand {
+  font-weight: 800;
+  font-size: 1.18em;
+  letter-spacing: 0.3px;
+  color: @mt_gold_text;
+}
+
+.brand-by {
+  font-size: 0.72em;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: @mt_dim;
+}
+
+.channel-filter {
+  margin: 6px 12px 2px 12px;
+}
+
+.channel-list {
+  padding: 6px 0 14px 0;
+}
+
+.navigation-sidebar.channel-list > row.section-row {
+  margin-top: 10px;
+  padding: 4px 10px;
+}
+
+.section-title {
+  font-size: 0.82em;
+  font-weight: 800;
+  color: @mt_dim;
+}
+
+.section-count {
+  font-size: 0.82em;
+  color: @mt_dim;
+  font-feature-settings: "tnum";
+}
+
+.section-row .chevron {
+  color: @mt_dim;
+  transition: transform 200ms cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+.section-row.collapsed .chevron {
+  transform: rotate(-90deg);
+}
+
+.navigation-sidebar.channel-list > row {
+  margin: 1px 6px;
+  padding: 6px 10px;
+  border-radius: 9px;
+  transition: background-color 180ms ease-out;
+}
+
+.navigation-sidebar.channel-list > row:selected {
+  background-color: alpha(@mt_gold, 0.15);
+}
+
+.navigation-sidebar.channel-list > row:selected:hover {
+  background-color: alpha(@mt_gold, 0.21);
+}
+
+.navigation-sidebar.channel-list > row:selected .channel-name {
+  font-weight: 700;
+}
+
+.all-icon {
+  color: @mt_gold_text;
+  min-width: 26px;
+  min-height: 26px;
+}
+
+.count-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background-color: @mt_gold;
+  color: @mt_gold_ink;
+  font-size: 0.78em;
+  font-weight: 800;
+  font-feature-settings: "tnum";
+}
+
+/* ── Header ──────────────────────────────────────────────────────────── */
+
+.spinning image {
+  animation: mt-spin 900ms linear infinite;
+}
+
+@keyframes mt-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* ── Hero ────────────────────────────────────────────────────────────── */
+
+.hero {
+  padding: 18px 32px 14px 32px;
+}
+
+.hero-title {
+  font-size: 2.05em;
+  font-weight: 800;
+  letter-spacing: -0.6px;
+}
+
+.hero-sub {
+  color: @mt_dim;
+  font-size: 1.05em;
+}
+
+.hero-sub.news {
+  color: @mt_gold_text;
+  font-weight: 700;
+}
+
+/* Two identical animations, alternated, so every view change replays it. */
+.hero.rise-a { animation: mt-rise-a 520ms cubic-bezier(0.16, 1, 0.3, 1); }
+.hero.rise-b { animation: mt-rise-b 520ms cubic-bezier(0.16, 1, 0.3, 1); }
+
+@keyframes mt-rise-a {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@keyframes mt-rise-b {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ── Filters ─────────────────────────────────────────────────────────── */
+
+.filters {
+  margin-top: 12px;
+}
+
+.filters button {
+  min-height: 30px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-weight: 600;
+  background-color: alpha(currentColor, 0.08);
+  box-shadow: none;
+  transition: background-color 160ms ease-out, color 160ms ease-out;
+}
+
+.filters button:hover {
+  background-color: alpha(currentColor, 0.13);
+}
+
+.filters button:checked,
+.filters button:checked:hover {
+  background-color: @mt_gold;
+  color: @mt_gold_ink;
+}
+
+/* ── Feed grid ───────────────────────────────────────────────────────── */
+
+gridview.video-grid {
+  background: none;
+}
+
+/* Item padding makes the gaps between cards: 22px across, 30px down. */
+gridview.video-grid > child,
+gridview.video-grid > child:hover,
+gridview.video-grid > child:selected,
+gridview.video-grid > child:focus-visible {
+  padding: 6px 11px 30px 11px;
+  border-radius: 0;
+  background: none;
+  outline: none;
+  box-shadow: none;
+}
+
+.list-note {
+  margin-top: 40px;
+  color: @mt_dim;
+  font-size: 1.05em;
+}
+
+/* ── Cards ───────────────────────────────────────────────────────────── */
+
+/* Cards are buttons for focus, keyboard and accessibility; drop the button look. */
+button.video-card,
+button.video-card:hover,
+button.video-card:active,
+button.video-card:focus-visible {
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+  min-height: 0;
+  border-radius: 14px;
+  background: none;
+  box-shadow: none;
+  outline: none;
+  font-weight: normal;
+}
+
+button.video-card:focus-visible .thumb-frame {
+  outline: 3px solid @mt_gold_text;
+  outline-offset: 3px;
+}
+
+/* Entrance: a short rise that settles with a slight overshoot. Only the
+   first screen of a freshly shown feed plays it. */
+button.video-card.enter {
+  animation: mt-card-in 560ms cubic-bezier(0.2, 1.25, 0.4, 1);
+}
+
+@keyframes mt-card-in {
+  from { opacity: 0; transform: translateY(22px); }
+}
+
+.thumb-frame {
+  border-radius: 12px;
+  background-color: @mt_seat;
+  transition: transform 480ms cubic-bezier(0.2, 1.5, 0.4, 1);
+}
+
+/* Press sinks quickly; release springs back on the transition above. */
+button.video-card:active .thumb-frame {
+  transform: scale(0.965);
+  transition: transform 90ms ease-out;
+}
+
+.play-glyph {
+  min-width: 54px;
+  min-height: 54px;
+  border-radius: 999px;
+  background-color: alpha(@mt_velvet, 0.68);
+  color: @mt_gold;
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 160ms ease-out,
+              transform 300ms cubic-bezier(0.3, 1.5, 0.5, 1);
+}
+
+button.video-card:hover .play-glyph {
+  opacity: 1;
+  transform: none;
+}
+
+/* ── Chips on thumbnails ─────────────────────────────────────────────── */
+
+.chip {
+  margin: 9px;
+  padding: 2px 8px;
+  border-radius: 7px;
+  font-size: 0.8em;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+  color: white;
+  background-color: alpha(black, 0.66);
+}
+
+/* "New" glows three times when it first appears, then stays still. */
+.chip.new {
+  color: @mt_gold_ink;
+  background-color: @mt_gold;
+  animation: mt-glow 1.9s ease-out 3;
+}
+
+.chip.watched-chip {
+  color: @mt_gold;
+  background-color: alpha(@mt_velvet, 0.82);
+}
+
+@keyframes mt-glow {
+  0%   { box-shadow: 0 0 0 0 alpha(@mt_gold, 0.6); }
+  70%  { box-shadow: 0 0 0 9px alpha(@mt_gold, 0); }
+  100% { box-shadow: 0 0 0 0 alpha(@mt_gold, 0); }
+}
+
+/* ── Card text ───────────────────────────────────────────────────────── */
+
+.card-text {
+  margin: 0 2px;
+}
+
+.card-title {
+  font-weight: 700;
+  line-height: 1.25;
+  /* Always two lines tall, so every card and every grid row is the same height
+     and the grid never has to guess (which is what made scrolling jump). */
+  min-height: 2.5em;
+}
+
+.card-meta {
+  min-height: 1.4em;
+}
+
+button.video-card.watched .card-title {
+  color: @mt_dim;
+}
+
+.card-channel {
+  color: @mt_dim;
+  font-size: 0.92em;
+}
+
+.card-views {
+  color: @mt_dim;
+  font-size: 0.88em;
+  font-feature-settings: "tnum";
+}
+
+/* ── Loading skeletons ───────────────────────────────────────────────── */
+
+.skeleton-grid {
+  padding: 2px 32px 56px 32px;
+}
+
+.skeleton-grid > flowboxchild {
+  padding: 0;
+  background: none;
+}
+
+.skeleton { animation: mt-breathe 1.6s ease-in-out infinite; }
+.skeleton.d1 { animation-delay: 160ms; }
+.skeleton.d2 { animation-delay: 320ms; }
+.skeleton.d3 { animation-delay: 480ms; }
+
+.sk-thumb {
+  border-radius: 12px;
+  background-color: @mt_seat;
+}
+
+.sk-line {
+  border-radius: 6px;
+  background-color: @mt_seat;
+}
+
+@keyframes mt-breathe {
+  0%   { opacity: 0.4; }
+  50%  { opacity: 1; }
+  100% { opacity: 0.4; }
+}
+
+/* ── Floating controls ───────────────────────────────────────────────── */
+
+.fab {
+  margin: 0 28px 28px 0;
+  min-width: 48px;
+  min-height: 48px;
+  padding: 0;
+  border-radius: 999px;
+  background-color: @mt_gold;
+  color: @mt_gold_ink;
+  box-shadow: 0 8px 22px alpha(black, 0.35);
+}
+
+.new-pill {
+  margin-top: 14px;
+  padding: 8px 18px;
+  border-radius: 999px;
+  background-color: @mt_gold;
+  color: @mt_gold_ink;
+  font-weight: 800;
+  box-shadow: 0 8px 22px alpha(black, 0.35);
+}
+
+.fab:hover, .new-pill:hover {
+  background-color: shade(@mt_gold, 1.07);
+}
+
+.fab:active, .new-pill:active {
+  background-color: shade(@mt_gold, 0.92);
+}
+
+/* ── Empty states ────────────────────────────────────────────────────── */
+
+statuspage.floaty image.icon {
+  color: @mt_gold_text;
+  animation: mt-float 5s ease-in-out infinite;
+}
+
+@keyframes mt-float {
+  0%   { transform: translateY(0); }
+  50%  { transform: translateY(-7px); }
+  100% { transform: translateY(0); }
+}
+
+/* ── Watching ────────────────────────────────────────────────────────── */
+
+.watch {
+  background-color: black;
+}
+
+/* The picture fades up once the first frame is ready... */
+.watch .video {
+  opacity: 0;
+  transition: opacity 700ms ease-out;
+}
+
+.watch .video.playing {
+  opacity: 1;
+}
+
+/* ...while the waiting poster, dimmed and soft, fades away. */
+/* A tiny copy of the thumbnail stretched to full size: looks blurred, costs
+   nothing per frame (no filter), and is removed once the picture is up. */
+.watch .poster {
+  opacity: 0.5;
+  transition: opacity 1000ms ease-in-out;
+}
+
+.watch .poster.gone {
+  opacity: 0;
+}
+
+.watch spinner {
+  color: @mt_gold;
+}
+
+.watch-bar {
+  padding: 10px 16px 48px 10px;
+  background-image: linear-gradient(to bottom, alpha(black, 0.72), alpha(black, 0));
+  color: white;
+}
+
+.watch-title {
+  font-weight: 700;
+  font-size: 1.12em;
+}
+
+.watch-channel {
+  font-size: 0.9em;
+  color: alpha(white, 0.7);
+}
+
+.watch-controls {
+  padding: 52px 16px 10px 16px;
+  background-image: linear-gradient(to top, alpha(black, 0.8), alpha(black, 0));
+  color: white;
+}
+
+.watch-bar button, .watch-controls button {
+  color: white;
+}
+
+.watch-time {
+  margin-left: 6px;
+  color: alpha(white, 0.85);
+  font-feature-settings: "tnum";
+}
+
+.watch .speed {
+  min-width: 44px;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+}
+
+/* Seek bar: a thin gold line that thickens under the pointer. */
+.watch-seek {
+  padding: 8px 0;
+}
+
+.watch-seek trough {
+  min-height: 4px;
+  border-radius: 4px;
+  background-color: alpha(white, 0.22);
+  transition: min-height 160ms ease-out;
+}
+
+.watch-seek:hover trough {
+  min-height: 7px;
+}
+
+.watch-seek trough fill {
+  border-radius: 4px;
+  background-color: alpha(white, 0.3);
+}
+
+.watch-seek trough highlight {
+  border-radius: 4px;
+  background-color: @mt_gold;
+}
+
+.watch-seek slider {
+  min-width: 14px;
+  min-height: 14px;
+  margin: -6px;
+  border: none;
+  background-color: @mt_gold;
+  box-shadow: none;
+  transform: scale(0);
+  transition: transform 200ms cubic-bezier(0.3, 1.6, 0.5, 1);
+}
+
+.watch-seek:hover slider, .watch-seek slider:active {
+  transform: none;
+}
+
+.watch-volume trough {
+  min-height: 4px;
+  border-radius: 4px;
+  background-color: alpha(white, 0.22);
+}
+
+.watch-volume trough highlight {
+  border-radius: 4px;
+  background-color: white;
+}
+
+.watch-volume slider {
+  min-width: 12px;
+  min-height: 12px;
+  margin: -5px;
+  border: none;
+  background-color: white;
+  box-shadow: none;
+}
+
+.problem {
+  padding: 28px 32px;
+  border-radius: 18px;
+  background-color: alpha(@mt_velvet, 0.9);
+  color: white;
+}
+
+.problem image {
+  color: @mt_gold;
+}
+
+.problem-title {
+  font-weight: 800;
+  font-size: 1.3em;
+}
+
+.problem-detail {
+  color: alpha(white, 0.8);
+}
+
+.watch .start-over {
+  min-height: 28px;
+  padding: 0 12px;
+  margin-left: 8px;
+  border-radius: 999px;
+  background-color: alpha(white, 0.14);
+  color: white;
+  font-weight: 600;
+}
+
+.watch .start-over:hover {
+  background-color: alpha(white, 0.22);
+}
+
+/* ── Picture in picture ──────────────────────────────────────────────── */
+
+window.pip {
+  background-color: black;
+}
+
+.pip-shade,
+.pip-bar,
+.pip-play {
+  opacity: 0;
+  transition: opacity 180ms ease-out;
+}
+
+.pip.show-controls .pip-shade,
+.pip.show-controls .pip-bar,
+.pip.show-controls .pip-play {
+  opacity: 1;
+}
+
+.pip-shade {
+  background-color: alpha(black, 0.35);
+}
+
+.pip-bar {
+  padding: 6px;
+}
+
+.pip-bar button,
+.pip-play {
+  color: white;
+}
+
+.pip-play {
+  min-width: 52px;
+  min-height: 52px;
+  border-radius: 999px;
+  background-color: alpha(black, 0.45);
+}
+
+.watch .quality {
+  min-width: 52px;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+  color: white;
+}
