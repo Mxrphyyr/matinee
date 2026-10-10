@@ -36,6 +36,9 @@ check_tools() {
     # shellcheck disable=SC1111  # typographic quotes inside a message
     have mpv || warn "mpv isn't installed. Only “Open in mpv” needs it."
     $yt_dlp_found || warn "yt-dlp isn't installed. Search and playback need it (README section 2c)."
+    if ! have deno && [[ ! -x "$HOME/.local/bin/deno" ]]; then
+        warn "Deno isn't installed. yt-dlp needs it to play YouTube videos (README section 2c)."
+    fi
     return 0
 }
 

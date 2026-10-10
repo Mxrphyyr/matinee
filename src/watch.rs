@@ -10,7 +10,7 @@
 use crate::icons;
 use crate::model::Video;
 use crate::mpv::{self, Event, Format, Mpv, Render, Value};
-use crate::{tools, util};
+use crate::{perf, tools, util};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
@@ -65,6 +65,8 @@ impl Surface {
         surface.area.connect_render(move |_, _| {
             if let Some(surface) = weak.upgrade() {
                 if let Some(render) = surface.render.borrow().as_ref() {
+                    // A slow draw is a frame with new shaders to compile.
+                    let _timing = perf::span("video frame drawn", 8);
                     let (width, height) = surface.size.get();
                     render.draw(mpv::current_framebuffer(), width, height);
                 }
@@ -679,9 +681,15 @@ impl Watch {
         self.pip.borrow().is_some()
     }
 
-    /// Starts mpv ahead of time, so the first video opens without a pause.
+    /// Starts mpv and its renderer ahead of time, so the first video opens
+    /// without a pause: creating the renderer took 0.2 s on the owner's
+    /// machine. The page isn't on screen, so nothing is drawn yet.
     pub fn warm_up(self: &Rc<Self>) {
-        self.ensure_mpv();
+        if self.ensure_mpv().is_none() || self.in_pip() || self.shown.get() {
+            return;
+        }
+        self.main.area.set_visible(true);
+        self.attach(&self.main);
     }
 
     /// The player page left the screen. Playback stops unless the picture
@@ -717,7 +725,7 @@ impl Watch {
             pip.surface.release();
             pip.window.destroy();
         }
-        self.main.release();
+        // The page's renderer stays, ready for the next video.
         self.main.area.set_visible(false);
     }
 
@@ -738,11 +746,20 @@ impl Watch {
             script_opts.push(format!("ytdl_hook-ytdl_path={}", path.display()));
         }
         let script_opts = script_opts.join(",");
+        // Compiled shaders are kept on disk, so after the first video the
+        // first frame needn't wait for the compiler.
+        let shader_cache = glib::user_cache_dir().join("matinee").join("shaders");
+        let _ = std::fs::create_dir_all(&shader_cache);
+        let shader_cache = shader_cache.to_string_lossy().into_owned();
         let options: Vec<(&str, &str)> = vec![
             ("vo", "libmpv"),
-            // Hardware decoding with a copy back to memory works everywhere;
-            // MATINEE_HWDEC_INTEROP=1 tries zero-copy decoding instead.
-            ("hwdec", if interop() { "auto-safe" } else { "auto-copy-safe" }),
+            // Hardware decoding with a copy back to memory works everywhere.
+            // NVIDIA's decoder comes first (mpv's own choice was a Vulkan
+            // decoder that was slower and may run on another chip), then
+            // VA-API for Intel and AMD, then whatever mpv finds safe. An
+            // older libmpv takes only the last. MATINEE_HWDEC_INTEROP=1
+            // tries zero-copy decoding instead.
+            ("hwdec", if interop() { "nvdec,vaapi,auto-safe" } else { "nvdec-copy,vaapi-copy,auto-copy-safe" }),
             ("ytdl", "yes"),
             ("keep-open", "yes"),
             ("idle", "yes"),
@@ -756,6 +773,7 @@ impl Watch {
             ("audio-fallback-to-null", "yes"),
             ("volume", &volume),
             ("script-opts", &script_opts),
+            ("gpu-shader-cache-dir", &shader_cache),
         ];
         match Mpv::new(&options, move || {
             let _ = tx.try_send(());
@@ -784,6 +802,24 @@ impl Watch {
                         watch.drain_events();
                     }
                 });
+                if perf::enabled() {
+                    // How playback is going, every few seconds.
+                    let weak = Rc::downgrade(self);
+                    glib::timeout_add_seconds_local(5, move || {
+                        let Some(watch) = weak.upgrade() else { return glib::ControlFlow::Break };
+                        if let Some(mpv) = watch.mpv().filter(|_| watch.started.get()) {
+                            let get = |name: &str| mpv.string(name).unwrap_or_else(|| "?".into());
+                            perf::mark(&format!(
+                                "player: {} frames dropped, {} shown late, {} s buffered, waiting for data: {}",
+                                get("frame-drop-count"),
+                                get("vo-delayed-frame-count"),
+                                get("demuxer-cache-duration"),
+                                get("paused-for-cache")
+                            ));
+                        }
+                        glib::ControlFlow::Continue
+                    });
+                }
                 *self.mpv.borrow_mut() = Some(mpv.clone());
                 Some(mpv)
             }
@@ -839,6 +875,9 @@ impl Watch {
             pip.surface.release();
         }
         surface.area.make_current();
+        if perf::enabled() {
+            perf::mark(&format!("OpenGL drawn by {}", mpv::renderer_name().unwrap_or_else(|| "?".into())));
+        }
         if let Some(error) = surface.area.error() {
             self.show_problem(
                 "Video can't be shown here",
@@ -861,6 +900,7 @@ impl Watch {
         }) {
             Ok(render) => {
                 *surface.render.borrow_mut() = Some(render);
+                perf::mark("mpv renderer attached");
                 let area = surface.area.downgrade();
                 glib::spawn_future_local(async move {
                     while rx.recv().await.is_ok() {
@@ -1011,6 +1051,20 @@ impl Watch {
         self.set_busy(false);
         if self.started.replace(true) {
             return;
+        }
+        if let Some(mpv) = self.mpv().filter(|_| perf::enabled()) {
+            // By the first frame the decoder is running, so this is exact.
+            let get = |name: &str| mpv.string(name).unwrap_or_else(|| "?".into());
+            perf::mark(&format!(
+                "playing: {} {}x{} at {} fps, {} {}, decoded by {}",
+                get("video-codec"),
+                get("video-params/w"),
+                get("video-params/h"),
+                get("container-fps"),
+                get("video-params/pixelformat"),
+                get("video-params/primaries"),
+                get("hwdec-current")
+            ));
         }
         self.main.area.add_css_class("playing");
         self.poster.add_css_class("gone");

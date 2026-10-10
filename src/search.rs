@@ -1,16 +1,11 @@
 //! Search is delegated to yt-dlp. It is already needed for playback, and it is
-//! updated within days whenever YouTube changes its internals.
+//! updated within days whenever YouTube changes its internals. Results are
+//! read as they arrive (see `ytdlp`), so the first ones show within a second
+//! or two.
 
 use crate::model::{is_video_id, Video};
-use crate::{tools, util};
+use crate::ytdlp::{self, Stream, Update};
 use serde::Deserialize;
-use std::process::{Command, Output};
-
-#[derive(Deserialize)]
-struct Playlist {
-    #[serde(default)]
-    entries: Vec<Entry>,
-}
 
 #[derive(Deserialize)]
 struct Entry {
@@ -27,54 +22,15 @@ struct Entry {
     timestamp: Option<f64>,
 }
 
-pub fn search(query: &str, limit: usize) -> Result<Vec<Video>, String> {
-    // Searches go without the browser sign-in, which would add them to that
-    // account's search history, unless YouTube won't answer without one.
-    let mut output = run(query, limit, false)?;
-    let sign_in = tools::sign_in();
-    if !output.status.success() && sign_in.is_some() && util::is_bot_check(&error(&output)) {
-        output = run(query, limit, true)?;
-    }
-    if !output.status.success() {
-        let reason = error(&output);
-        if let Some(explained) = util::explain_ytdlp(&reason, sign_in.as_ref()) {
-            return Err(format!("{}. {}", explained.title, explained.detail));
-        }
-        return Err(format!("yt-dlp couldn't search: {reason}"));
-    }
-    parse(&output.stdout)
-}
-
-fn run(query: &str, limit: usize, signed_in: bool) -> Result<Output, String> {
-    let mut command = Command::new(tools::yt_dlp());
-    command.args(["--flat-playlist", "--dump-single-json", "--no-warnings", "--quiet"]);
-    if signed_in {
-        command.args(tools::sign_in_args());
-    }
-    command.arg(format!("ytsearch{limit}:{query}")).output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "Search needs yt-dlp. Install it from your package manager, then search again.".to_string()
-        } else {
-            format!("Couldn't run yt-dlp: {e}")
-        }
-    })
-}
-
-/// yt-dlp's explanation: the last thing it said.
-fn error(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let last = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no error message");
-    util::tidy_error(last)
-}
-
-pub fn parse(json: &[u8]) -> Result<Vec<Video>, String> {
-    let list: Playlist =
-        serde_json::from_slice(json).map_err(|e| format!("Unexpected output from yt-dlp: {e}"))?;
-    Ok(list.entries.into_iter().filter_map(to_video).collect())
+/// Starts a search for up to `limit` videos. Searches go without the
+/// browser sign-in, which would add them to that account's search history,
+/// unless YouTube refused to answer without one (`signed_in`).
+pub fn start(query: &str, limit: usize, signed_in: bool) -> Result<(Stream, async_channel::Receiver<Update>), String> {
+    ytdlp::start(&[], &format!("ytsearch{limit}:{query}"), ("", ""), None, signed_in)
 }
 
 /// One line of yt-dlp's `--flat-playlist --dump-json` output, as a video of
-/// the given channel.
+/// the given channel (for entries that don't name theirs).
 pub fn parse_line(line: &str, channel_id: &str, channel_name: &str) -> Option<Video> {
     let entry: Entry = serde_json::from_str(line).ok()?;
     let mut video = to_video(entry)?;
@@ -108,20 +64,35 @@ fn to_video(e: Entry) -> Option<Video> {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_line;
+
     #[test]
-    fn parses_flat_search() {
-        let json = br#"{"_type":"playlist","entries":[
-          {"_type":"url","ie_key":"Youtube","id":"dQw4w9WgXcQ","url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-           "title":"Lathe build","channel":"Tom","channel_id":"UCabcdefghijklmnopqrstuv","duration":754.0,"view_count":1234},
-          {"_type":"url","ie_key":"YoutubeTab","id":"UCabcdefghijklmnopqrstuv","title":"Tom"},
-          {"_type":"url","ie_key":"Youtube","id":"abcdefghijk","url":"https://www.youtube.com/shorts/abcdefghijk",
-           "title":"Short one","uploader":"Ann","duration":null,"view_count":null}
-        ]}"#;
-        let v = super::parse(json).unwrap();
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0].duration, Some(754));
-        assert_eq!(v[0].views, Some(1234));
-        assert_eq!(v[1].channel_name, "Ann");
-        assert!(v[1].is_short);
+    fn parses_flat_entries() {
+        let video = parse_line(
+            r#"{"_type":"url","ie_key":"Youtube","id":"dQw4w9WgXcQ","url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+               "title":"Lathe build","channel":"Tom","channel_id":"UCabcdefghijklmnopqrstuv","duration":754.0,"view_count":1234}"#,
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(video.duration, Some(754));
+        assert_eq!(video.views, Some(1234));
+        assert_eq!(video.channel_name, "Tom");
+
+        // Searches also return channels and playlists; those aren't videos.
+        assert!(parse_line(r#"{"_type":"url","ie_key":"YoutubeTab","id":"UCabcdefghijklmnopqrstuv","title":"Tom"}"#, "", "").is_none());
+
+        // A channel's own listing leaves the channel out; the caller supplies it.
+        let short = parse_line(
+            r#"{"_type":"url","ie_key":"Youtube","id":"abcdefghijk","url":"https://www.youtube.com/shorts/abcdefghijk",
+               "title":"Short one","duration":null,"view_count":null}"#,
+            "UCabcdefghijklmnopqrstuv",
+            "Ann",
+        )
+        .unwrap();
+        assert_eq!(short.channel_name, "Ann");
+        assert_eq!(short.channel_id, "UCabcdefghijklmnopqrstuv");
+        assert!(short.is_short);
+        assert!(parse_line("not json", "", "").is_none());
     }
 }

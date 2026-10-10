@@ -8,7 +8,7 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
 use std::rc::Rc;
 
-pub use gl::current_framebuffer;
+pub use gl::{current_framebuffer, renderer_name};
 
 #[repr(C)]
 struct Handle {
@@ -72,6 +72,7 @@ struct RawLogMessage {
     log_level: c_int,
 }
 
+const FORMAT_STRING: c_int = 1;
 const FORMAT_FLAG: c_int = 3;
 const FORMAT_DOUBLE: c_int = 5;
 
@@ -111,6 +112,7 @@ extern "C" {
     fn mpv_wait_event(ctx: *mut Handle, timeout: f64) -> *mut RawEvent;
     fn mpv_set_wakeup_callback(ctx: *mut Handle, cb: Option<unsafe extern "C" fn(*mut c_void)>, data: *mut c_void);
     fn mpv_error_string(error: c_int) -> *const c_char;
+    fn mpv_free(data: *mut c_void);
     fn mpv_render_context_create(res: *mut *mut RenderHandle, mpv: *mut Handle, params: *mut RenderParam) -> c_int;
     fn mpv_render_context_set_update_callback(
         ctx: *mut RenderHandle,
@@ -192,6 +194,10 @@ impl Mpv {
                 if *name == "vo" {
                     return Err(format!("this libmpv can't draw inside apps ({e})"));
                 }
+                // A libmpv too old for a list of decoders takes the last one alone.
+                if *name == "hwdec" && mpv.set_option(name, value.rsplit(',').next().unwrap_or(value)).is_ok() {
+                    continue;
+                }
                 // Builds differ (Lua, hardware decoding); a missing extra isn't fatal.
                 eprintln!("matinee: mpv ignored option {name}={value}: {e}");
             }
@@ -247,6 +253,21 @@ impl Mpv {
         let mut data: f64 = 0.0;
         let code = unsafe { mpv_get_property(self.handle, name.as_ptr(), FORMAT_DOUBLE, &mut data as *mut f64 as *mut c_void) };
         (code >= 0).then_some(data)
+    }
+
+    /// Any property as text, the way mpv would print it.
+    pub fn string(&self, name: &str) -> Option<String> {
+        let name = cstring(name);
+        let mut data: *mut c_char = ptr::null_mut();
+        let code = unsafe {
+            mpv_get_property(self.handle, name.as_ptr(), FORMAT_STRING, &mut data as *mut *mut c_char as *mut c_void)
+        };
+        if code < 0 || data.is_null() {
+            return None;
+        }
+        let text = unsafe { CStr::from_ptr(data) }.to_string_lossy().into_owned();
+        unsafe { mpv_free(data as *mut c_void) };
+        Some(text)
     }
 
     pub fn observe(&self, name: &str, format: Format) {
@@ -494,6 +515,23 @@ mod gl {
             Some(get) => get(name),
             None => std::ptr::null_mut(),
         }
+    }
+
+    /// What draws the current OpenGL context, such as "NVIDIA GeForce …" or
+    /// "Mesa Intel(R) Graphics"; for diagnostics.
+    pub fn renderer_name() -> Option<String> {
+        const GL_RENDERER: u32 = 0x1F01;
+        type GetString = unsafe extern "C" fn(u32) -> *const c_char;
+        let address = unsafe { proc_address(std::ptr::null_mut(), c"glGetString".as_ptr()) };
+        if address.is_null() {
+            return None;
+        }
+        let get: GetString = unsafe { std::mem::transmute::<*mut c_void, GetString>(address) };
+        let name = unsafe { get(GL_RENDERER) };
+        if name.is_null() {
+            return None;
+        }
+        Some(unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned())
     }
 
     /// The framebuffer GTK bound for the GLArea currently being drawn.

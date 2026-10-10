@@ -10,11 +10,11 @@ use crate::model::{Channel, Video};
 use crate::store::{Store, WindowState};
 use crate::thumbs::Thumbs;
 use crate::watch::{self, Watch, WatchHooks};
-use crate::{feed, history, icons, player, resolve, search, smooth, style, tools, trending, util, APP_ID};
+use crate::{feed, history, icons, perf, player, resolve, search, smooth, style, tools, trending, util, ytdlp, APP_ID};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -30,6 +30,12 @@ const SAVE_DELAY: Duration = Duration::from_millis(700);
 const ENTRANCE_WINDOW_US: i64 = 600_000;
 /// Thumbnail requests are recalculated at most this often while scrolling.
 const VISIBILITY_INTERVAL_US: i64 = 80_000;
+/// A long list goes into the grid a slice at a time between frames; this
+/// many items take about a millisecond.
+const GRID_SLICE: usize = 200;
+/// Channel rows added per idle moment: about 4 ms of work, one frame at
+/// 240 Hz.
+const SIDEBAR_SLICE: usize = 24;
 const LOGO_SVG: &[u8] = include_bytes!("../data/io.github.matinee.Matinee.svg");
 const QUALITIES: [(Option<u32>, &str); 6] = [
     (None, "Match my screen"),
@@ -125,8 +131,13 @@ pub struct Win {
     filter: Cell<Filter>,
     results: RefCell<Vec<Video>>,
     search_error: RefCell<Option<String>>,
+    /// The search in progress, reading results as they arrive.
+    search_stream: RefCell<Option<ytdlp::Stream>>,
     /// The current view's videos after filtering, in display order.
     shown: RefCell<Vec<Video>>,
+    /// Items still to go into the grid, a slice per idle moment.
+    grid_queue: RefCell<VecDeque<glib::BoxedAnyObject>>,
+    grid_pumping: Cell<bool>,
     card_min: Cell<i32>,
     /// Every card the grid has made, keyed by its widget.
     cards: RefCell<HashMap<gtk::Button, Rc<Card>>>,
@@ -138,10 +149,13 @@ pub struct Win {
     /// Just-added channels, whose existing uploads shouldn't count as new.
     quiet_channels: RefCell<HashSet<String>>,
     sidebar_badges: RefCell<Vec<(RowTarget, gtk::Label)>>,
+    /// Bumped by every rebuild of the channel list, so slices of an older
+    /// one stop.
+    sidebar_generation: Cell<u64>,
     /// Older uploads per channel, read from yt-dlp this session.
     history: RefCell<HashMap<String, Vec<Video>>>,
     history_done: RefCell<HashSet<String>>,
-    history_stream: RefCell<Option<(String, history::Stream)>>,
+    history_stream: RefCell<Option<(String, ytdlp::Stream)>>,
     /// More older uploads have been asked for and haven't arrived yet.
     history_asked: Cell<bool>,
     refreshing: Cell<bool>,
@@ -470,7 +484,10 @@ impl Win {
                 filter: Cell::new(Filter::All),
                 results: RefCell::default(),
                 search_error: RefCell::default(),
+                search_stream: RefCell::default(),
                 shown: RefCell::default(),
+                grid_queue: RefCell::default(),
+                grid_pumping: Cell::new(false),
                 card_min: Cell::new(card_min),
                 cards: RefCell::default(),
                 bound: RefCell::default(),
@@ -478,6 +495,7 @@ impl Win {
                 new_ids: RefCell::default(),
                 quiet_channels: RefCell::default(),
                 sidebar_badges: RefCell::default(),
+                sidebar_generation: Cell::new(0),
                 history: RefCell::default(),
                 history_done: RefCell::default(),
                 history_stream: RefCell::default(),
@@ -498,29 +516,40 @@ impl Win {
         win
     }
 
-    /// Shows the cached feed right away, then checks for new uploads unless
-    /// that was done only a little while ago.
+    /// Shows the window at once and fills in the feed right after its first
+    /// frame, so the start never waits on the grid.
     pub fn start(self: &Rc<Self>) {
-        let (always_dark, smooth_scrolling, sign_in) = {
+        let (always_dark, smooth_scrolling, sign_in, has_channels, has_feed, channels) = {
             let st = self.store.borrow();
-            (st.always_dark, !st.no_smooth_scroll, st.cookies_browser.clone())
+            (
+                st.always_dark,
+                !st.no_smooth_scroll,
+                st.cookies_browser.clone(),
+                !st.channels.is_empty(),
+                !st.feed.is_empty(),
+                st.channels.len(),
+            )
         };
         style::set_always_dark(always_dark);
         smooth::set_enabled(smooth_scrolling);
         tools::set_sign_in(sign_in.as_deref());
-        self.rebuild_sidebar();
-        let (has_channels, has_feed) = {
-            let st = self.store.borrow();
-            (!st.channels.is_empty(), !st.feed.is_empty())
-        };
-        if has_feed || !has_channels {
-            self.render();
+        if has_feed {
+            // The greeting over the loading page, for the first frame only.
+            let hour = glib::DateTime::now_local().map(|d| d.hour()).unwrap_or(12);
+            self.loading_title.set_label(util::greeting(hour));
+            self.loading_sub.set_label(&format!("The latest from {}", util::count(channels, "channel", "channels")));
+            self.hero.set_visible(false);
+            self.stack.set_visible_child_name("loading");
         }
-        // Opening Matinee again soon after shouldn't ask YouTube for every channel again.
-        let interval = self.refresh_interval().unwrap_or(i64::from(DEFAULT_REFRESH_MINUTES) * 60);
-        if !has_feed || self.since_refresh() >= interval {
-            self.refresh(false);
-        }
+        perf::watch_frames(&self.window);
+        let weak = Rc::downgrade(self);
+        self.window.add_tick_callback(move |_, _| {
+            // The first frame is about to be drawn; the rest follows it.
+            if let Some(win) = weak.upgrade() {
+                glib::idle_add_local_once(move || win.fill_in(has_channels, has_feed));
+            }
+            glib::ControlFlow::Break
+        });
         // Start the video engine in the background so the first video opens at once.
         let watch = Rc::downgrade(&self.watch);
         glib::timeout_add_local_once(Duration::from_secs(2), move || {
@@ -529,6 +558,43 @@ impl Win {
             }
         });
         self.schedule_refresh();
+        self.note_last_crash();
+    }
+
+    /// The feed, then the channel list, then a check for new uploads unless
+    /// one was done only a little while ago.
+    fn fill_in(self: &Rc<Self>, has_channels: bool, has_feed: bool) {
+        perf::mark("first frame drawn");
+        if has_feed || !has_channels {
+            self.render();
+        }
+        // The channel list a moment later, so the feed's entrance isn't held
+        // up by building hundreds of rows.
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(win) = weak.upgrade() {
+                win.rebuild_sidebar();
+            }
+        });
+        // Opening Matinee again soon after shouldn't ask YouTube for every channel again.
+        let interval = self.refresh_interval().unwrap_or(i64::from(DEFAULT_REFRESH_MINUTES) * 60);
+        if !has_feed || self.since_refresh() >= interval {
+            self.refresh(false);
+        }
+    }
+
+    /// Says where to find the details if Matinee stopped unexpectedly last
+    /// time. The note shows once; the log is kept under another name.
+    fn note_last_crash(&self) {
+        let log = crate::crash_log();
+        if !log.is_file() {
+            return;
+        }
+        let kept = log.with_file_name("crash-previous.log");
+        if std::fs::rename(&log, &kept).is_ok() {
+            let toast = self.toast("Matinee stopped unexpectedly last time. The details are in ~/.cache/matinee/crash-previous.log");
+            toast.set_timeout(12);
+        }
     }
 
     fn connect_signals(self: &Rc<Self>, to_top_button: &gtk::Button, factory: &gtk::SignalListItemFactory) {
@@ -586,6 +652,7 @@ impl Win {
             let (width, height) = window.default_size();
             this.store.borrow_mut().window = Some(WindowState { width, height, maximized: window.is_maximized() });
             this.stop_history();
+            this.stop_search();
             this.watch.stop();
             this.save_now();
             glib::Propagation::Proceed
@@ -716,6 +783,10 @@ impl Win {
         self.action("focus-search", |w| {
             w.after_navigation();
             w.search_entry.grab_focus();
+        });
+        self.action_with_id("search", |w, query| {
+            w.search_entry.set_text(query);
+            w.start_search(query.to_string());
         });
         self.action_with_id("play", |w, id| w.play(id));
         self.action_with_id("play-external", |w, id| {
@@ -910,9 +981,12 @@ impl Win {
         self.suppress_select.set(false);
     }
 
-    /// Recreates the channel rows. Only needed when the channel list itself
-    /// changes; new-video counts update in place.
-    fn rebuild_sidebar(&self) {
+    /// Recreates the channel rows: the fixed rows at once, then the channels
+    /// a few dozen per idle moment, so hundreds of them never stall a frame.
+    /// Only needed when the channel list itself changes; new-video counts
+    /// update in place.
+    fn rebuild_sidebar(self: &Rc<Self>) {
+        let _timing = perf::span("channel list", 0);
         let mut channels = self.store.borrow().channels.clone();
         channels.sort_by_cached_key(|c| c.name.to_lowercase());
         self.suppress_select.set(true);
@@ -938,13 +1012,6 @@ impl Win {
         names.push(String::new());
         *self.section_row.borrow_mut() = Some(section);
 
-        for channel in channels {
-            let (row, badge) = sidebar_row(RowIcon::Avatar(&channel.name), &channel.name);
-            self.channel_list.append(&row);
-            names.push(channel.name.to_lowercase());
-            badges.push((RowTarget::Channel(channel.id.clone()), badge));
-            targets.push(RowTarget::Channel(channel.id));
-        }
         *self.sidebar_filter.targets.borrow_mut() = targets;
         *self.sidebar_filter.names.borrow_mut() = names;
         *self.sidebar_badges.borrow_mut() = badges;
@@ -952,6 +1019,39 @@ impl Win {
         self.suppress_select.set(false);
         self.select_row_for_view();
         self.update_sidebar_counts();
+        let generation = self.sidebar_generation.get() + 1;
+        self.sidebar_generation.set(generation);
+        self.add_channel_rows(Rc::new(channels), 0, generation);
+    }
+
+    fn add_channel_rows(self: &Rc<Self>, channels: Rc<Vec<Channel>>, from: usize, generation: u64) {
+        // A newer rebuild has taken over.
+        if generation != self.sidebar_generation.get() {
+            return;
+        }
+        let _timing = perf::span("channel rows", 3);
+        let to = (from + SIDEBAR_SLICE).min(channels.len());
+        for channel in &channels[from..to] {
+            // The row's place is on record before the row exists, so the
+            // list's filter (which reads it as the row is added) finds it.
+            self.sidebar_filter.targets.borrow_mut().push(RowTarget::Channel(channel.id.clone()));
+            self.sidebar_filter.names.borrow_mut().push(channel.name.to_lowercase());
+            let (row, badge) = sidebar_row(RowIcon::Avatar(&channel.name), &channel.name);
+            self.sidebar_badges.borrow_mut().push((RowTarget::Channel(channel.id.clone()), badge));
+            self.channel_list.append(&row);
+        }
+        if to < channels.len() {
+            let weak = Rc::downgrade(self);
+            glib::idle_add_local_once(move || {
+                if let Some(win) = weak.upgrade() {
+                    win.add_channel_rows(channels, to, generation);
+                }
+            });
+        } else {
+            self.select_row_for_view();
+            self.update_sidebar_counts();
+            perf::mark("channel list complete");
+        }
     }
 
     /// Folds or unfolds the Channels section.
@@ -1004,8 +1104,11 @@ impl Win {
     }
 
     fn show_view(self: &Rc<Self>, view: View) {
-        if !matches!(view, View::Search(_)) && !self.search_entry.text().is_empty() {
-            self.search_entry.set_text("");
+        if !matches!(view, View::Search(_)) {
+            self.stop_search();
+            if !self.search_entry.text().is_empty() {
+                self.search_entry.set_text("");
+            }
         }
         *self.view.borrow_mut() = view;
         self.select_row_for_view();
@@ -1040,6 +1143,7 @@ impl Win {
 
     /// Fills the feed for the current view and filter, with the entrance.
     fn render(self: &Rc<Self>) {
+        let _timing = perf::span("render", 0);
         self.new_pill.set_reveal_child(false);
         let view = self.view.borrow().clone();
         // Older uploads are only read for the channel on screen.
@@ -1080,6 +1184,7 @@ impl Win {
         let nothing_here = list.is_empty();
         *self.shown.borrow_mut() = list;
         if !has_any && !channel_pending {
+            self.grid_queue.borrow_mut().clear();
             self.model.remove_all();
             self.update_hero(true);
             self.show_empty(&view);
@@ -1099,13 +1204,57 @@ impl Win {
         self.entrance_until
             .set(if animate { glib::monotonic_time() + ENTRANCE_WINDOW_US } else { 0 });
         self.scroller.vadjustment().set_value(0.0);
-        self.model.splice(0, self.model.n_items(), &items);
+        self.fill_grid(items);
         if let View::Channel(id) = &view {
             if channel_pending && !self.history_running(id) {
                 self.start_history(id, false);
             }
         }
         self.update_hero(true);
+    }
+
+    /// Puts `items` in the grid: enough for the first screens at once, the
+    /// rest a slice at a time between frames, so a long feed never stalls.
+    fn fill_grid(self: &Rc<Self>, items: Vec<glib::BoxedAnyObject>) {
+        let first = (self.columns() * 10).clamp(60, 200).min(items.len());
+        self.model.splice(0, self.model.n_items(), &items[..first]);
+        {
+            let mut queue = self.grid_queue.borrow_mut();
+            queue.clear();
+            queue.extend(items.into_iter().skip(first));
+        }
+        self.pump_grid();
+    }
+
+    /// Adds `items` after everything else, behind any slices still waiting.
+    fn append_grid(self: &Rc<Self>, items: Vec<glib::BoxedAnyObject>) {
+        if self.grid_queue.borrow().is_empty() {
+            self.model.splice(self.model.n_items(), 0, &items);
+        } else {
+            self.grid_queue.borrow_mut().extend(items);
+            self.pump_grid();
+        }
+    }
+
+    fn pump_grid(self: &Rc<Self>) {
+        if self.grid_queue.borrow().is_empty() || self.grid_pumping.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(win) = weak.upgrade() else { return };
+            win.grid_pumping.set(false);
+            let slice: Vec<glib::BoxedAnyObject> = {
+                let mut queue = win.grid_queue.borrow_mut();
+                let count = queue.len().min(GRID_SLICE);
+                queue.drain(..count).collect()
+            };
+            if !slice.is_empty() {
+                let _timing = perf::span("grid slice", 3);
+                win.model.splice(win.model.n_items(), 0, &slice);
+            }
+            win.pump_grid();
+        });
     }
 
     // ── Channel history ────────────────────────────────────────────────
@@ -1132,8 +1281,8 @@ impl Win {
             let mut failure = None;
             while let Ok(update) = updates.recv().await {
                 match update {
-                    history::Update::Videos(batch) => this.add_history(&id, batch),
-                    history::Update::Failed(reason) => failure = Some(reason),
+                    ytdlp::Update::Videos(batch) => this.add_history(&id, batch),
+                    ytdlp::Update::Failed(reason) => failure = Some(reason),
                 }
             }
             this.finish_history(&id, failure);
@@ -1163,7 +1312,7 @@ impl Win {
         if !visible.is_empty() {
             // Appended at the end, so the part of the grid you're looking at stays put.
             let items: Vec<glib::BoxedAnyObject> = visible.iter().cloned().map(glib::BoxedAnyObject::new).collect();
-            self.model.splice(self.model.n_items(), 0, &items);
+            self.append_grid(items);
             self.shown.borrow_mut().extend(visible);
             self.note.set_visible(false);
         }
@@ -1242,6 +1391,7 @@ impl Win {
     }
 
     fn bind_card(self: &Rc<Self>, card: &Rc<Card>, video: &Video, position: u32) {
+        let _timing = perf::span("card", 2);
         self.release_card(card);
         let opts = {
             let st = self.store.borrow();
@@ -1323,6 +1473,7 @@ impl Win {
     /// flat on long scrolls. The grid only positions on-screen cards, so
     /// "ahead" is counted in places in the feed rather than in pixels.
     fn update_visibility(&self) {
+        let _timing = perf::span("thumbnail pass", 2);
         let height = self.scroller.height() as f32;
         if height <= 0.0 {
             return;
@@ -1350,7 +1501,7 @@ impl Win {
             return;
         }
         let screen = last - first + 1;
-        if last + 2 * screen >= self.model.n_items() {
+        if last + 2 * screen >= self.model.n_items() && self.grid_queue.borrow().is_empty() {
             self.want_more_history();
         }
         let near = first.saturating_sub(screen)..=last + screen;
@@ -1740,25 +1891,100 @@ impl Win {
         self.hero.set_visible(false);
         self.stack.set_visible_child_name("loading");
         self.after_navigation();
+        self.stop_search();
+        self.results.borrow_mut().clear();
+        self.run_search(query, generation, false);
+    }
 
-        let this = self.clone();
-        glib::spawn_future_local(async move {
-            let q = query.clone();
-            let result = gio::spawn_blocking(move || search::search(&q, SEARCH_RESULTS)).await;
-            // Ignore results for a search that has since been replaced.
-            if this.search_gen.get() != generation || !this.in_search() {
+    /// Runs the search, showing results as they arrive. The browser sign-in
+    /// is used only after YouTube refused to answer without it.
+    fn run_search(self: &Rc<Self>, query: String, generation: u64, signed_in: bool) {
+        let (stream, updates) = match search::start(&query, SEARCH_RESULTS, signed_in) {
+            Ok(started) => started,
+            Err(message) => {
+                *self.search_error.borrow_mut() = Some(message);
+                self.render();
                 return;
             }
-            match result {
-                Ok(Ok(videos)) => *this.results.borrow_mut() = videos,
-                Ok(Err(message)) => {
-                    this.results.borrow_mut().clear();
-                    *this.search_error.borrow_mut() = Some(message);
+        };
+        *self.search_stream.borrow_mut() = Some(stream);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let mut failure = None;
+            while let Ok(update) = updates.recv().await {
+                // A search that has since been replaced is ignored.
+                if this.search_gen.get() != generation || !this.in_search() {
+                    return;
                 }
-                Err(_) => return,
+                match update {
+                    ytdlp::Update::Videos(batch) => this.add_results(batch),
+                    ytdlp::Update::Failed(reason) => failure = Some(reason),
+                }
             }
-            this.render();
+            if this.search_gen.get() == generation && this.in_search() {
+                this.finish_search(query, generation, signed_in, failure);
+            }
         });
+    }
+
+    fn add_results(self: &Rc<Self>, batch: Vec<Video>) {
+        let (first, fresh) = {
+            let mut results = self.results.borrow_mut();
+            let mut known: HashSet<String> = results.iter().map(|v| v.id.clone()).collect();
+            let fresh: Vec<Video> = batch.into_iter().filter(|v| known.insert(v.id.clone())).collect();
+            let first = results.is_empty();
+            results.extend(fresh.iter().cloned());
+            (first, fresh)
+        };
+        if first {
+            // The first results replace the "Searching" page, with the entrance.
+            self.render();
+            return;
+        }
+        let now = util::now();
+        let visible: Vec<Video> = {
+            let st = self.store.borrow();
+            fresh.into_iter().filter(|v| self.passes_filter(v, &st, now)).collect()
+        };
+        if !visible.is_empty() {
+            let items: Vec<glib::BoxedAnyObject> = visible.iter().cloned().map(glib::BoxedAnyObject::new).collect();
+            self.append_grid(items);
+            self.shown.borrow_mut().extend(visible);
+        }
+        self.update_hero(false);
+    }
+
+    fn finish_search(self: &Rc<Self>, query: String, generation: u64, signed_in: bool, failure: Option<String>) {
+        self.stop_search();
+        let nothing = self.results.borrow().is_empty();
+        let Some(reason) = failure else {
+            if nothing {
+                // "No videos found".
+                self.render();
+            }
+            return;
+        };
+        let sign_in = tools::sign_in();
+        if !nothing {
+            self.toast_refusal(&reason, sign_in.filter(|_| signed_in).as_ref(), "Some results didn't load");
+            return;
+        }
+        if !signed_in && sign_in.is_some() && util::is_bot_check(&reason) {
+            self.run_search(query, generation, true);
+            return;
+        }
+        let message = match util::explain_ytdlp(&reason, sign_in.filter(|_| signed_in).as_ref()) {
+            Some(explained) => format!("{}. {}", explained.title, explained.detail),
+            None => format!("yt-dlp couldn't search: {reason}"),
+        };
+        *self.search_error.borrow_mut() = Some(message);
+        self.render();
+    }
+
+    fn stop_search(&self) {
+        if let Some(stream) = self.search_stream.borrow_mut().take() {
+            stream.stop();
+        }
     }
 
     // ── Subscriptions ──────────────────────────────────────────────────
@@ -2043,9 +2269,10 @@ impl Win {
         }
     }
 
-    /// Remembers where an unfinished video was left, so it can resume there.
+    /// Remembers where an unfinished video was left, so it can resume there:
+    /// anything past the first seconds and short of the end.
     fn record_progress(&self, video: &Video, position: f64, duration: f64) {
-        let unfinished = duration > 0.0 && position > 20.0 && duration - position > 30.0 && position / duration < 0.95;
+        let unfinished = duration > 0.0 && position > 5.0 && duration - position > 20.0 && position / duration < 0.95;
         {
             let mut st = self.store.borrow_mut();
             if unfinished {
@@ -2307,6 +2534,8 @@ impl Win {
             .comments("Follow YouTube channels without ads, tracking or an account.")
             .copyright("© 2026 Mxrphyy")
             .license_type(gtk::License::Gpl30)
+            .website("https://github.com/Mxrphyyr/matinee")
+            .issue_url("https://github.com/Mxrphyyr/matinee/issues")
             .build();
         if gtk::IconTheme::for_display(&WidgetExt::display(&self.window)).has_icon(APP_ID) {
             about.set_application_icon(APP_ID);

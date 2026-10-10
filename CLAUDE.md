@@ -44,6 +44,10 @@ YouTube extraction.
 - `cargo build`, `cargo test` (26 unit tests of pure logic; no display needed).
   AerynOS has no GNU `ar`: plain cargo needs `AR=llvm-ar` (install.sh sets it).
 - `cargo run` opens the app on the owner's desktop
+- `MATINEE_PERF=1 ~/.local/bin/matinee` prints timing: start-up stages, a
+  frame report every 5 s (late frames and the longest UI work), and what the
+  player decodes and drops. Ask the owner to run it via `!` and send the
+  output; it's the only way to measure their 4K 240 Hz desktop.
 - `./install.sh`: release build, installed into ~/.local (maps cc/ar/ld to
   clang/llvm-ar/lld when GNU tools are missing). `--check`, `--uninstall`.
 - `./sync-to-github.sh "message"`: commit everything, pull (rebase), push.
@@ -62,7 +66,7 @@ features (`gtk` v4_12, `adw` v1_5). It tests, packages
 `matinee-X.Y.Z-x86_64-linux.tar.gz` plus `.sha256`, and when the version in
 Cargo.toml has no release yet, publishes one with the notes in
 `.github/release-notes.md` plus GitHub's generated notes. Published so far:
-v0.3.0, v0.3.1 and v0.3.2. The owner's gh login has the `workflow` scope needed to
+v0.3.0, v0.3.1, v0.3.2 and v0.4.0. The owner's gh login has the `workflow` scope needed to
 push workflow changes. A release archive installs with its own `./install.sh`,
 which detects the prebuilt binary and checks libraries before installing.
 
@@ -70,17 +74,19 @@ which detects the prebuilt binary and checks libraries before installing.
 
 | File | What it does |
 |---|---|
-| `main.rs` | entry point; picks GTK's OpenGL renderer (`GSK_RENDERER=gl` on GTK 4.18+, `ngl` before) unless the user set one; shortcuts |
+| `main.rs` | entry point; picks GTK's OpenGL renderer (`GSK_RENDERER=gl` on GTK 4.18+, `ngl` before) unless the user set one; crash log (`~/.cache/matinee/crash.log`, noted at the next start); shortcuts |
 | `window.rs` | main window: sidebar drawer (filter, foldable Channels, Trending), feed grid, channel history, search, Preferences, saving |
 | `card.rs`, `thumb.rs` | recyclable feed card; `ThumbPaintable` draws fade, zoom, dim and progress in `snapshot` (no relayout) |
 | `thumbs.rs` | thumbnail loader: 6 workers, newest-first queue, cancellation, 120-image memory cache |
 | `smooth.rs` | smooth wheel scrolling (exponential glide that follows the grid's own corrections) |
 | `watch.rs` | embedded player: `Surface` (GLArea plus the one mpv renderer), picture in picture, quality menu, controls, errors |
 | `mpv.rs` | libmpv FFI: client API and OpenGL render API, EGL/GLX proc lookup |
-| `feed.rs` | channel RSS (Atom) feeds: 8 at once on a first load, later 4 at once with pauses |
-| `history.rs` | a channel's older uploads from yt-dlp, read on demand (60 per request); reports yt-dlp's error |
+| `feed.rs` | channel RSS (Atom) feeds: 8 at once on a first load, later 4 at once with pauses; one retry |
+| `ytdlp.rs` | runs yt-dlp for a list and streams its entries as they arrive; optional page gating (reading pauses until `more`) |
+| `history.rs` | a channel's older uploads: `ytdlp` with 60 per page, `--sleep-requests 1` |
 | `trending.rs` | Trending ranking (subscriptions only) |
-| `search.rs` | yt-dlp search and flat-entry parsing |
+| `search.rs` | yt-dlp search through `ytdlp` (results show as they come) and flat-entry parsing |
+| `perf.rs` | the `MATINEE_PERF=1` diagnostics: marks, timed spans, frame report |
 | `resolve.rs` | channel ids from links and @handles; Takeout, NewPipe, FreeTube and OPML import |
 | `store.rs` | `~/.local/share/matinee/state.json`; every field has a serde default |
 | `tools.rs` | finds yt-dlp (prefers ~/.local/bin) and mpv; browser detection and the sign-in arguments |
@@ -96,7 +102,14 @@ which detects the prebuilt binary and checks libraries before installing.
   `min-height: 2.5em`, meta `1.4em`): variable heights made the grid
   re-estimate rows and jump while scrolling. Thumbnails are requested for
   cards within one screen (that pass runs at most every 80 ms) and dropped
-  beyond three screens.
+  beyond three screens. A view's list goes into the grid in slices
+  (`fill_grid`: the first screens at once, then 200 per idle moment);
+  appends (older uploads, search results) queue behind pending slices.
+- **Start-up.** `Win::start` shows the loading page with the greeting, and
+  fills the feed, then the channel list, in idles after the first frame
+  (`fill_in`). Measured in the hidden test desktop: GTK's own init is 1.3 s
+  and the first frame 300 ms (shader compile with no cache); Matinee's own
+  work is under 60 ms. The owner's desktop numbers come from `MATINEE_PERF`.
 - **Checking for new uploads.** Automatic checks happen only while the feed
   is on screen in the focused window (a 60 s tick, window focus, and leaving
   the player all call `refresh_if_due`), at most every `refresh_minutes`
@@ -106,19 +119,29 @@ which detects the prebuilt binary and checks libraries before installing.
 - **Player.** mpv renders into a `GtkGLArea` through the render API. libmpv
   allows one render context per mpv handle, so picture in picture moves it:
   set `vid=no`, free the old context with its GL context current, create the
-  new one, set `vid=auto`. OpenGL and loading start only after the page's
-  `shown` signal so the slide never waits; mpv is warmed up 2 s after launch.
+  new one, set `vid=auto`. mpv and its renderer are created at the warm-up
+  2 s after launch (on the unmapped page: creating the renderer took 180 ms
+  on the owner's machine) and the renderer is kept between videos; loading
+  starts only after the page's `shown` signal so the slide never waits.
+  mpv's compiled shaders are cached in `~/.cache/matinee/shaders`.
   The waiting poster is a 32×18 downscale stretched by the GPU (looks
   blurred, costs nothing) and is hidden once video plays. The seek bar and
   clock refresh at most 4 times a second and only while visible. Screen idle
   is inhibited during playback; `audio-fallback-to-null=yes`. Hardware
-  decoding is `auto-copy-safe`; zero-copy interop only with
-  `MATINEE_HWDEC_INTEROP=1` (it gave decode artifacts in testing).
-- **Quality.** `ytdl-format` is set per load, for the embedded player and the
-  external mpv alike. "Match my screen" (the default) uses the monitor's
-  physical height (logical height times the surface's fractional scale): at
-  least 2000 px gives 2160, at least 1350 gives 1440, otherwise 1080.
-  Changing quality reloads from the current position.
+  decoding is `hwdec=nvdec-copy,vaapi-copy,auto-copy-safe` (an older libmpv
+  gets just the last): on the owner's Intel + RTX 5070 Ti machine mpv's own
+  `auto-copy-safe` picked `vulkan-copy`, 30–40% slower than `nvdec-copy` in
+  a local 4K benchmark and possibly on the Intel chip. Zero-copy interop
+  (`nvdec,vaapi,auto-safe`) only with `MATINEE_HWDEC_INTEROP=1`; `nvdec`
+  worked with NVIDIA's GL in the hidden desktop, the owner's screen decides.
+- **Quality.** `ytdl-format` (`tools::ytdl_format`) is set per load, for
+  the embedded player and the external mpv alike, and prefers SDR:
+  `[dynamic_range=?SDR]` first, since yt-dlp's default sort would pick the
+  HDR stream at 4K (heavier, and tone-mapped). "Match my screen" (the
+  default) uses the monitor's physical height (logical height times the
+  surface's fractional scale): at least 2000 px gives 2160, at least 1350
+  gives 1440, otherwise 1080. Changing quality reloads from the current
+  position.
 - **yt-dlp.** Used for playback (mpv's ytdl_hook), "Open in mpv", search,
   channel lookup and channel history. Recommended setup on the owner's
   machine: the standalone `yt-dlp_linux` in ~/.local/bin (update with
@@ -142,6 +165,10 @@ which detects the prebuilt binary and checks libraries before installing.
   ranks subscription uploads from the last 14 days by
   `ln((views+10)/(expected+10)) - 0.07*days + 0.12*log10(views+1)`, where
   expected is the channel's median views scaled by `1 - e^(-hours/36)`.
+- **Search.** `win.search` (a string action, also used by the hidden-desktop
+  tests) streams results through `ytdlp`; the first batch renders the page,
+  later ones append. Entries that arrive together are sent together (80 ms
+  lull); a bot check with no results retries with the sign-in.
 - **State.** Saves are batched (700 ms) and forced on close. New settings use
   `Option` or negative booleans (`no_resume`) so older state files load.
 
@@ -161,8 +188,11 @@ hand-made `state.json` (set `last_refresh` to now so it fetches nothing).
 Inside SCRIPT, start `target/debug/matinee`, trigger window actions with
 `gdbus call --session --dest io.github.matinee.Matinee --object-path
 /io/github/matinee/Matinee/window/1 --method org.gtk.Actions.Activate
-play "[<'VIDEO_ID'>]" '{}'` (or `preferences`, `sign-in`, `show-channel`),
-and capture with `spectacle -b -n -f -o shot.png`.
+play "[<'VIDEO_ID'>]" '{}'` (or `preferences`, `sign-in`, `show-channel`,
+`search`), and capture with `spectacle -b -n -f -o shot.png`. That desktop
+drew with the owner's NVIDIA GPU at 60 Hz, so GL and decoding checks are
+meaningful there; frame rates at 4K 240 Hz are not. A copy of the owner's
+real `state.json` (with `last_refresh` set to now) makes a realistic feed.
 
 ## Ideas not done yet
 

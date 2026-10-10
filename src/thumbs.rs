@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 type Waiter = Box<dyn FnOnce(&gdk::Texture)>;
@@ -26,6 +26,13 @@ const DISK_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 struct Queue {
     jobs: Mutex<VecDeque<String>>,
     ready: Condvar,
+}
+
+impl Queue {
+    /// The job list, even if a worker gave up while holding it.
+    fn jobs(&self) -> MutexGuard<'_, VecDeque<String>> {
+        self.jobs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 pub struct Thumbs {
@@ -49,13 +56,13 @@ impl Thumbs {
             let dir = dir.clone();
             std::thread::spawn(move || loop {
                 let id = {
-                    let mut jobs = queue.jobs.lock().unwrap();
+                    let mut jobs = queue.jobs();
                     loop {
                         // Newest first: the cards on screen right now.
                         if let Some(id) = jobs.pop_back() {
                             break id;
                         }
-                        jobs = queue.ready.wait(jobs).unwrap();
+                        jobs = queue.ready.wait(jobs).unwrap_or_else(PoisonError::into_inner);
                     }
                 };
                 let texture = load(&dir, &id);
@@ -105,7 +112,7 @@ impl Thumbs {
         let waiters = waiting.entry(video_id.to_string()).or_default();
         waiters.push((token, Box::new(done)));
         if waiters.len() == 1 {
-            self.queue.jobs.lock().unwrap().push_back(video_id.to_string());
+            self.queue.jobs().push_back(video_id.to_string());
             self.queue.ready.notify_one();
         }
         Some(token)
@@ -119,11 +126,12 @@ impl Thumbs {
         waiters.retain(|(t, _)| *t != token);
         if waiters.is_empty() {
             waiting.remove(video_id);
-            self.queue.jobs.lock().unwrap().retain(|queued| queued != video_id);
+            self.queue.jobs().retain(|queued| queued != video_id);
         }
     }
 
     fn finish(&self, id: String, texture: Option<gdk::Texture>) {
+        let _timing = crate::perf::span("thumbnail arrival", 2);
         let waiters = self.waiting.borrow_mut().remove(&id).unwrap_or_default();
         let Some(texture) = texture else { return };
         {

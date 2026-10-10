@@ -263,7 +263,8 @@ You can also subscribe from search results: right-click a video and choose
 - **Filters:** *All*, *Unwatched* or *This week*, right under the greeting.
 - **Grid:** the newest videos first, all the way down. Only the cards near
   the screen use memory, so even thousands of videos scroll smoothly.
-- **Search bar:** searches all of YouTube, not just your channels.
+- **Search bar:** searches all of YouTube, not just your channels. Results
+  appear as they arrive.
 
 ### Mouse and touch
 
@@ -436,6 +437,7 @@ are for special setups:
 | `GDK_DEBUG=portals` | Use Plasma's own file dialog for importing. |
 | `GSK_RENDERER` | Matinee uses GTK's OpenGL renderer (`gl`, called `ngl` before GTK 4.18) because video is drawn with OpenGL; set `vulkan` to use GTK's default instead. |
 | `MATINEE_HWDEC_INTEROP=1` | Experimental: zero-copy hardware decoding, which hands decoded frames straight to the GPU. |
+| `MATINEE_PERF=1` | Prints timing to the terminal: start-up stages, a report every 5 seconds of late frames and the slowest work, and what the player is decoding and dropping. Useful when reporting stutter. |
 | `MATINEE_FEED_BASE`, `MATINEE_THUMB_BASE` | Fetch feeds or thumbnails through a mirror or proxy that copies YouTube's paths. Mainly for testing. |
 
 To make a variable permanent for the launcher entry, edit
@@ -512,6 +514,13 @@ aren't copied between graphics systems. If you set `GSK_RENDERER` yourself,
 try removing it or setting `GSK_RENDERER=gl` (`ngl` before GTK 4.18). You
 can also try `MATINEE_HWDEC_INTEROP=1` (see section 8). If it still
 stutters, run `~/.local/bin/matinee` from Konsole and send the output.
+
+**Videos stutter or show artefacts.**
+Matinee decodes with your graphics card and plays SDR streams even for HDR
+uploads, which avoids most of this. If it still happens, try
+`MATINEE_HWDEC_INTEROP=1` (section 8), and run Matinee from Konsole with
+`MATINEE_PERF=1` while it plays: the output says which decoder is in use and
+how many frames are dropped.
 
 **The player says "Video can't be shown here".**
 Matinee draws video with OpenGL, and it isn't working on this system, which
@@ -602,7 +611,9 @@ cargo test           # parser and formatting tests
 | `src/thumb.rs` | thumbnail drawing: fade, zoom, dimming, resume bar |
 | `src/smooth.rs` | smooth mouse-wheel scrolling |
 | `src/watch.rs` | the embedded player, its controls and picture in picture |
-| `src/history.rs` | streams a channel's full upload history from yt-dlp |
+| `src/ytdlp.rs` | runs yt-dlp for a list of videos and streams its entries as they arrive |
+| `src/history.rs` | a channel's full upload history, a page at a time |
+| `src/perf.rs` | the `MATINEE_PERF=1` timing output |
 | `src/trending.rs` | the Trending ranking |
 | `src/mpv.rs` | the libmpv binding: playback engine and OpenGL drawing |
 | `data/style.css` | all styling and motion |

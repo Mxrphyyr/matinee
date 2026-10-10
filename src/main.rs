@@ -7,6 +7,7 @@ mod icons;
 mod model;
 mod mpv;
 mod net;
+mod perf;
 mod player;
 mod resolve;
 mod search;
@@ -20,13 +21,40 @@ mod trending;
 mod util;
 mod watch;
 mod window;
+mod ytdlp;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 
 pub const APP_ID: &str = "io.github.matinee.Matinee";
 
+/// Where a crash's details are written, for the note Matinee shows next time.
+pub fn crash_log() -> std::path::PathBuf {
+    glib::user_cache_dir().join("matinee").join("crash.log")
+}
+
+/// Writes what went wrong, and where in the code, before the program stops.
+fn install_crash_log() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = crash_log();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text = format!(
+            "Matinee {} stopped unexpectedly at {} (Unix seconds)\n\n{info}\n\n{}",
+            env!("CARGO_PKG_VERSION"),
+            util::now(),
+            std::backtrace::Backtrace::force_capture()
+        );
+        let _ = std::fs::write(&path, text);
+        previous(info);
+    }));
+}
+
 fn main() -> glib::ExitCode {
+    perf::init();
+    install_crash_log();
     // Video is drawn with OpenGL. GTK's OpenGL renderer composites it directly;
     // other renderers copy every frame between graphics APIs, which costs the
     // most at full screen. A GSK_RENDERER set by the user still wins. GTK 4.18
@@ -37,9 +65,11 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|_| {
+        perf::mark("GTK ready");
         gtk::Window::set_default_icon_name(APP_ID);
         style::install();
         icons::install();
+        perf::mark("styles and icons installed");
     });
     app.connect_activate(|app| {
         if let Some(window) = app.active_window() {
@@ -47,12 +77,20 @@ fn main() -> glib::ExitCode {
             return;
         }
         let win = window::Win::new(app);
+        perf::mark("window built");
         win.window.present();
         win.start();
     });
 
     let quit = gio::ActionEntry::builder("quit")
-        .activate(|app: &adw::Application, _, _| app.quit())
+        // Closing the main window (rather than quitting outright) notes where
+        // you were in a video and the window's size; the app ends with it.
+        .activate(|app: &adw::Application, _, _| {
+            match app.windows().into_iter().find(|window| window.is::<adw::ApplicationWindow>()) {
+                Some(main) => main.close(),
+                None => app.quit(),
+            }
+        })
         .build();
     app.add_action_entries([quit]);
     app.set_accels_for_action("app.quit", &["<Control>q"]);
@@ -63,5 +101,11 @@ fn main() -> glib::ExitCode {
     app.set_accels_for_action("win.preferences", &["<Control>comma"]);
     app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
 
-    app.run()
+    let code = app.run();
+    // A second launch only brings the running Matinee forward and returns
+    // here at once; say so, or a terminal run looks like it did nothing.
+    if app.is_remote() {
+        eprintln!("Matinee is already running; its window was brought forward. Quit it (Ctrl+Q) to start afresh.");
+    }
+    code
 }

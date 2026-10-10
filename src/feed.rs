@@ -23,7 +23,18 @@ pub fn feed_url(channel_id: &str) -> String {
 }
 
 pub fn fetch_channel(channel_id: &str) -> Result<ChannelFeed, String> {
-    parse(&net::get_text(&feed_url(channel_id))?)
+    let url = feed_url(channel_id);
+    let xml = match net::get_text(&url) {
+        Ok(xml) => xml,
+        // Connections drop and servers hiccup; one more try a moment later
+        // usually works. A definite "no" (HTTP 4xx) isn't worth repeating.
+        Err(first) if !first.starts_with("HTTP 4") => {
+            std::thread::sleep(Duration::from_millis(1500));
+            net::get_text(&url).map_err(|_| first)?
+        }
+        Err(e) => return Err(e),
+    };
+    parse(&xml)
 }
 
 /// Fetches every channel. Blocking: run it off the UI thread. A first load

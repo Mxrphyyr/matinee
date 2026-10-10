@@ -116,3 +116,61 @@ the reasons.
   reads Firefox's saved sign-in each time.
 - The README gained the bot-check steps (section 7) and Deno, which current
   yt-dlp needs for YouTube.
+
+## 0.4.0: speed and stability
+
+- The owner reported slow start-up, stutter when scrolling and switching
+  views, player stutter with artefacts in some videos, and slow searches,
+  and chose features for later rounds (see CLAUDE.md's roadmap note in
+  memory): 0.5.0 player features, 0.6.0 browsing features.
+- Measured on the owner's real data (3,842 videos, 271 channels) in the
+  hidden test desktop: loading and saving the 1 MB state file 1–2 ms,
+  Trending 0.3 ms, the thumbnail pass under 1 ms, the channel list 38 ms,
+  filling the grid 20–33 ms (GTK binding ~80 visible cards is the floor),
+  GTK's own init 1.3 s and the first frame 300 ms (shader compile without
+  a cache). The screen is 4K at 240 Hz with 145% scaling, so a frame is
+  4 ms there.
+- Changes: the window shows before the feed and channel list are built; the
+  grid fills in slices; search results stream in (first page in about
+  1.5 s instead of all 40 after 2 s); a feed fetch is retried once; a crash
+  log is written and noted at the next start; `MATINEE_PERF=1` diagnostics
+  so the owner can report real-desktop numbers; About links to GitHub;
+  `install.sh --check` warns about missing Deno.
+- Player: the machine has an Intel Arrow Lake chip and an RTX 5070 Ti.
+  mpv's `auto-copy-safe` chose `vulkan-copy`; a local 4K benchmark (H.264,
+  VP9, AV1 test clips) showed `nvdec-copy` 30–40% faster and `vaapi-copy`
+  slowest, so the decoder order is now nvdec-copy, vaapi-copy, then auto.
+  yt-dlp's default sort prefers HDR at 4K, which needs tone mapping and
+  can look wrong: streams are now chosen SDR first. Zero-copy `nvdec` works
+  with NVIDIA's GL in the hidden desktop; whether it should be the default
+  depends on the owner's test.
+- The owner found start-up "really fast" but resume doing nothing. Cause:
+  Ctrl+Q called `app.quit()`, which ends the program without the window's
+  close-request, so the resume spot, the window size and any unsaved change
+  were lost. Ctrl+Q now closes the main window. A spot is kept from 5 s
+  watched (was 20 s) while more than 20 s remain.
+- The owner's first `MATINEE_PERF=1` run (4K, 240 Hz, 145% scaling):
+  window built at 108 ms, first frame 190 ms, feed on screen 230 ms; while
+  scrolling, 1,200 frames per 5 s with the worst at 8–9 ms; a 1080p60 AV1
+  video decoded by `nvdec-copy` with 1 frame dropped at the start, none
+  late, never waiting for data. Two hitches: 54 ms when the channel list was
+  built during the feed's entrance (now 40 rows per idle moment), and
+  270 ms when the video opened (the player's first frame compiles shaders;
+  now `gpu-shader-cache-dir` keeps them on disk, and the first draw is
+  timed).
+- The second run played 4K60 VP9 through `nvdec-copy`: 1 frame dropped at
+  the start, none late, never waiting for data, steady frames within
+  8–12 ms. Opening a video still stalled twice: 180 ms creating mpv's
+  renderer after the slide, and 260 ms compiling shaders at the first real
+  frame (the cache was empty on that first run). The renderer is now created
+  at the 2 s warm-up on the unmapped page and kept between videos, which
+  changes the 0.2-era rule "OpenGL starts after the slide lands": the GL
+  context exists before the slide, but no video work happens during it.
+- A regression caught by the hidden desktop's screenshots: calling
+  `app.register()` before `connect_startup` (for an "already running"
+  notice) fired `startup` with no handlers, so the CSS and fallback icons
+  were never installed and the app ran in plain GTK styling for three test
+  builds. The notice now prints after `run()` returns, when `is_remote()`
+  is known. Lesson: GApplication emits `startup` inside `register`.
+- The owner confirmed the look was back and playback started cleanly, and
+  0.4.0 was released. Next: 0.5.0 (player features), then 0.6.0 (browsing).

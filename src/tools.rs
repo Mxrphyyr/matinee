@@ -147,9 +147,16 @@ pub fn yt_dlp() -> PathBuf {
     find_yt_dlp().unwrap_or_else(|| PathBuf::from("yt-dlp"))
 }
 
-/// yt-dlp's choice of streams for playing a video at most `height` pixels tall.
+/// yt-dlp's choice of streams for playing a video at most `height` pixels
+/// tall. SDR comes first: at 4K, yt-dlp's "best" would otherwise be the HDR
+/// stream, which is heavier to play and needs tone mapping that can look
+/// wrong on an ordinary screen. (yt-dlp marks HDR streams and leaves SDR
+/// ones unmarked, hence `=?`.)
 pub fn ytdl_format(height: u32) -> String {
-    format!("bestvideo[height<=?{height}]+bestaudio/best[height<=?{height}]/best")
+    format!(
+        "bestvideo[height<=?{height}][dynamic_range=?SDR]+bestaudio/\
+         bestvideo[height<=?{height}]+bestaudio/best[height<=?{height}]/best"
+    )
 }
 
 /// The browsers set up for this account, in the order Preferences lists them.
