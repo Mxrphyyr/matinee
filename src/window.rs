@@ -9,7 +9,7 @@ use crate::card::{self, Card, CardOpts};
 use crate::model::{Channel, Video};
 use crate::store::{Store, WindowState};
 use crate::thumbs::Thumbs;
-use crate::watch::{Watch, WatchHooks};
+use crate::watch::{self, Watch, WatchHooks};
 use crate::{feed, history, icons, player, resolve, search, smooth, style, tools, trending, util, APP_ID};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
@@ -44,17 +44,6 @@ const REFRESH_CHOICES: [(u32, &str); 4] = [
     (20, "Every 20 minutes"),
     (60, "Every hour"),
     (0, "Only when I refresh"),
-];
-/// Browsers yt-dlp can borrow a YouTube sign-in from.
-const BROWSERS: [(Option<&str>, &str); 8] = [
-    (None, "Off"),
-    (Some("firefox"), "Firefox"),
-    (Some("chrome"), "Google Chrome"),
-    (Some("chromium"), "Chromium"),
-    (Some("brave"), "Brave"),
-    (Some("edge"), "Microsoft Edge"),
-    (Some("vivaldi"), "Vivaldi"),
-    (Some("opera"), "Opera"),
 ];
 
 #[derive(Clone, PartialEq)]
@@ -132,7 +121,6 @@ pub struct Win {
     thumbs: Rc<Thumbs>,
     store: Rc<RefCell<Store>>,
     save_source: Rc<RefCell<Option<glib::SourceId>>>,
-    refresh_source: RefCell<Option<glib::SourceId>>,
     view: RefCell<View>,
     filter: Cell<Filter>,
     results: RefCell<Vec<Video>>,
@@ -478,7 +466,6 @@ impl Win {
                 thumbs: Thumbs::new(),
                 store: Rc::new(RefCell::new(store)),
                 save_source: Rc::default(),
-                refresh_source: RefCell::default(),
                 view: RefCell::new(View::Feed),
                 filter: Cell::new(Filter::All),
                 results: RefCell::default(),
@@ -511,15 +498,16 @@ impl Win {
         win
     }
 
-    /// Shows the cached feed right away, then checks for new uploads.
+    /// Shows the cached feed right away, then checks for new uploads unless
+    /// that was done only a little while ago.
     pub fn start(self: &Rc<Self>) {
-        let (always_dark, smooth_scrolling) = {
+        let (always_dark, smooth_scrolling, sign_in) = {
             let st = self.store.borrow();
-            (st.always_dark, !st.no_smooth_scroll)
+            (st.always_dark, !st.no_smooth_scroll, st.cookies_browser.clone())
         };
         style::set_always_dark(always_dark);
         smooth::set_enabled(smooth_scrolling);
-        tools::set_cookies_browser(self.store.borrow().cookies_browser.clone());
+        tools::set_sign_in(sign_in.as_deref());
         self.rebuild_sidebar();
         let (has_channels, has_feed) = {
             let st = self.store.borrow();
@@ -528,7 +516,11 @@ impl Win {
         if has_feed || !has_channels {
             self.render();
         }
-        self.refresh(false);
+        // Opening Matinee again soon after shouldn't ask YouTube for every channel again.
+        let interval = self.refresh_interval().unwrap_or(i64::from(DEFAULT_REFRESH_MINUTES) * 60);
+        if !has_feed || self.since_refresh() >= interval {
+            self.refresh(false);
+        }
         // Start the video engine in the background so the first video opens at once.
         let watch = Rc::downgrade(&self.watch);
         glib::timeout_add_local_once(Duration::from_secs(2), move || {
@@ -585,6 +577,8 @@ impl Win {
                 // Playback continues if the picture moved to its own window.
                 this.watch.page_closed();
                 this.save_later();
+                // Back at the feed: catch up if a check came due while watching.
+                this.refresh_if_due();
             }
         });
         let this = self.clone();
@@ -717,6 +711,7 @@ impl Win {
         self.action("import", |w| w.import_dialog());
         self.action("about", |w| w.about());
         self.action("preferences", |w| w.preferences());
+        self.action("sign-in", |w| w.sign_in_dialog());
         self.action("toggle-sidebar", |w| w.split.set_show_sidebar(!w.split.shows_sidebar()));
         self.action("focus-search", |w| {
             w.after_navigation();
@@ -819,23 +814,51 @@ impl Win {
         self.store.borrow().save();
     }
 
+    /// Checks for new uploads when they're due, but only while the feed is
+    /// in front of you: a window in the background, or a video playing, asks
+    /// YouTube for nothing. Coming back to the feed catches up.
     fn schedule_refresh(self: &Rc<Self>) {
-        if let Some(id) = self.refresh_source.borrow_mut().take() {
-            id.remove();
-        }
-        let minutes = self.store.borrow().refresh_minutes.unwrap_or(DEFAULT_REFRESH_MINUTES);
-        if minutes == 0 {
-            return;
-        }
         let weak = Rc::downgrade(self);
-        let id = glib::timeout_add_seconds_local(minutes * 60, move || match weak.upgrade() {
+        glib::timeout_add_seconds_local(60, move || match weak.upgrade() {
             Some(win) => {
-                win.refresh(false);
+                win.refresh_if_due();
                 glib::ControlFlow::Continue
             }
             None => glib::ControlFlow::Break,
         });
-        *self.refresh_source.borrow_mut() = Some(id);
+        let weak = Rc::downgrade(self);
+        self.window.connect_is_active_notify(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.refresh_if_due();
+            }
+        });
+    }
+
+    fn refresh_if_due(self: &Rc<Self>) {
+        let Some(interval) = self.refresh_interval() else { return };
+        let browsing = self.nav.visible_page().and_then(|page| page.tag()).as_deref() == Some("browse");
+        if browsing && self.window.is_active() && self.since_refresh() >= interval {
+            self.refresh(false);
+        }
+    }
+
+    /// Seconds between automatic checks, or None if they're turned off.
+    fn refresh_interval(&self) -> Option<i64> {
+        match self.store.borrow().refresh_minutes.unwrap_or(DEFAULT_REFRESH_MINUTES) {
+            0 => None,
+            minutes => Some(i64::from(minutes) * 60),
+        }
+    }
+
+    /// Seconds since the feed was last checked for new uploads. A check
+    /// "in the future" (the clock was wrong then) counts as long ago.
+    fn since_refresh(&self) -> i64 {
+        let age = util::now() - self.store.borrow().last_refresh.unwrap_or(0);
+        if age < 0 {
+            i64::MAX
+        } else {
+            age
+        }
     }
 
     // ── Sidebar ────────────────────────────────────────────────────────
@@ -1079,7 +1102,7 @@ impl Win {
         self.model.splice(0, self.model.n_items(), &items);
         if let View::Channel(id) = &view {
             if channel_pending && !self.history_running(id) {
-                self.start_history(id);
+                self.start_history(id, false);
             }
         }
         self.update_hero(true);
@@ -1094,20 +1117,26 @@ impl Win {
             .is_some_and(|(running, _)| running == id)
     }
 
-    fn start_history(self: &Rc<Self>, id: &str) {
+    /// Reads a channel's older uploads, with the browser sign-in only when
+    /// YouTube has refused to answer without it.
+    fn start_history(self: &Rc<Self>, id: &str, signed_in: bool) {
         self.stop_history();
         let name = self.store.borrow().channel_name(id).unwrap_or_default();
         // Without yt-dlp the channel page simply shows its newest videos.
-        let Ok((stream, batches)) = history::start(id, &name) else { return };
+        let Ok((stream, updates)) = history::start(id, &name, signed_in) else { return };
         *self.history_stream.borrow_mut() = Some((id.to_string(), stream));
         self.history_asked.set(false);
         let this = self.clone();
         let id = id.to_string();
         glib::spawn_future_local(async move {
-            while let Ok(batch) = batches.recv().await {
-                this.add_history(&id, batch);
+            let mut failure = None;
+            while let Ok(update) = updates.recv().await {
+                match update {
+                    history::Update::Videos(batch) => this.add_history(&id, batch),
+                    history::Update::Failed(reason) => failure = Some(reason),
+                }
             }
-            this.finish_history(&id);
+            this.finish_history(&id, failure);
         });
     }
 
@@ -1141,7 +1170,7 @@ impl Win {
         self.update_hero(false);
     }
 
-    fn finish_history(&self, id: &str) {
+    fn finish_history(self: &Rc<Self>, id: &str, failure: Option<String>) {
         let finished = {
             let mut slot = self.history_stream.borrow_mut();
             if slot.as_ref().is_some_and(|(running, _)| running == id) {
@@ -1151,16 +1180,34 @@ impl Win {
             }
         };
         // A stream that was stopped early isn't complete; it starts over next time.
-        if let Some((_, stream)) = finished {
-            stream.stop();
+        let Some((_, stream)) = finished else { return };
+        let signed_in = stream.signed_in;
+        stream.stop();
+        let here = *self.view.borrow() == View::Channel(id.to_string());
+        let Some(reason) = failure else {
             self.history_done.borrow_mut().insert(id.to_string());
-            if *self.view.borrow() == View::Channel(id.to_string()) {
+            if here {
                 if self.shown.borrow().is_empty() {
                     self.note.set_label("This channel has no videos to show.");
                 }
                 self.update_hero(false);
             }
+            return;
+        };
+        // A failed read isn't marked done, so the next visit tries again.
+        if !here {
+            return;
         }
+        if !signed_in && util::is_bot_check(&reason) && tools::sign_in().is_some() {
+            self.start_history(id, true);
+            return;
+        }
+        if self.shown.borrow().is_empty() {
+            self.note.set_label("This channel's videos didn't load.");
+        }
+        self.update_hero(false);
+        let sign_in = tools::sign_in().filter(|_| signed_in);
+        self.toast_refusal(&reason, sign_in.as_ref(), "Older videos from this channel didn't load");
     }
 
     /// Near the end of a channel's list: read the next page of older uploads.
@@ -1542,6 +1589,9 @@ impl Win {
         self.refresh_button.set_tooltip_text(Some("Refreshing…"));
 
         let first_load = self.store.borrow().feed.is_empty();
+        // A first load (or a new channel) is fetched quickly while you wait;
+        // later checks take their time, so YouTube never sees a burst.
+        let gentle = matches!(mode, Fetch::Refresh { .. }) && !first_load;
         if first_load && !self.in_search() {
             self.loading_title.set_label("Fetching your feed");
             self.loading_sub.set_label(&format!(
@@ -1554,9 +1604,10 @@ impl Win {
 
         let this = self.clone();
         glib::spawn_future_local(async move {
-            let report = gio::spawn_blocking(move || feed::fetch_all(&channels)).await;
+            let report = gio::spawn_blocking(move || feed::fetch_all(&channels, gentle)).await;
             if let Fetch::Refresh { .. } = mode {
                 this.refreshing.set(false);
+                this.store.borrow_mut().last_refresh = Some(util::now());
             }
             this.busy.set(this.busy.get() - 1);
             if this.busy.get() == 0 {
@@ -1657,11 +1708,7 @@ impl Win {
         let mut unique = HashSet::new();
         feed.retain(|v| unique.insert(v.id.clone()));
 
-        {
-            let ids: HashSet<&str> = feed.iter().map(|v| v.id.as_str()).collect();
-            st.watched.retain(|id| ids.contains(id.as_str()));
-            st.progress.retain(|id, _| ids.contains(id.as_str()));
-        }
+        st.forget_leaving(&feed);
         let fresh = feed
             .iter()
             .filter(|v| !st.seen.contains(&v.id))
@@ -1936,13 +1983,16 @@ impl Win {
     /// Plays in mpv's own window, optionally from `start` seconds in.
     fn play_external(self: &Rc<Self>, video: &Video, start: Option<f64>) {
         let id = video.id.as_str();
-        match player::spawn(video, start) {
+        let quality = self.store.borrow().quality;
+        let height = quality.unwrap_or_else(|| watch::screen_height(Some(self.window.upcast_ref())));
+        match player::spawn(video, start, height) {
             Ok(child) => {
                 self.toast(&format!(
                     "Playing “{}” in {}",
                     util::ellipsize(&video.title, 48),
                     player::name()
                 ));
+                let was_watched = self.store.borrow().watched.contains(id);
                 self.set_watched(id, true);
                 // Wait on a plain thread: a long film shouldn't tie up the I/O pool.
                 let (tx, rx) = async_channel::bounded(1);
@@ -1950,9 +2000,18 @@ impl Win {
                     let _ = tx.send_blocking(player::wait(child));
                 });
                 let this = self.clone();
+                let id = id.to_string();
                 glib::spawn_future_local(async move {
-                    if let Ok(Err(message)) = rx.recv().await {
-                        this.toast(&message);
+                    if let Ok(Err(reason)) = rx.recv().await {
+                        // yt-dlp refused before anything played: not watched after all.
+                        if !reason.is_empty() && !was_watched {
+                            this.set_watched(&id, false);
+                        }
+                        this.toast_refusal(
+                            &reason,
+                            tools::sign_in().as_ref(),
+                            "mpv couldn't play that video. Updating yt-dlp usually fixes this.",
+                        );
                     }
                 });
             }
@@ -2067,17 +2126,19 @@ impl Win {
         quality_row.set_subtitle("Where a video starts; change it for one video from the player");
         let resume_row = switch_row("Resume where I left off", "", resume);
         let external_row = switch_row("Play in a separate window", "Open videos in mpv's own window", external);
-        let cookies = self.store.borrow().cookies_browser.clone();
-        let browser_labels: Vec<&str> = BROWSERS.iter().map(|(_, label)| *label).collect();
-        let browser_index = BROWSERS.iter().position(|(b, _)| *b == cookies.as_deref()).unwrap_or(0);
-        let cookies_row = combo_row("Use a browser's YouTube sign-in", &browser_labels, browser_index);
-        cookies_row.set_subtitle(
-            "Only if YouTube keeps asking whether you're a bot. YouTube can then link what you watch to that account.",
+        let sign_in = self.store.borrow().cookies_browser.clone();
+        let choices = self.sign_in_choices();
+        let browser_labels: Vec<&str> = choices.iter().map(|(_, name)| name.as_str()).collect();
+        let browser_index = choices.iter().position(|(key, _)| *key == sign_in).unwrap_or(0);
+        let sign_in_row = combo_row("Use a browser's YouTube sign-in", &browser_labels, browser_index);
+        sign_in_row.set_subtitle(
+            "Only if YouTube keeps asking whether you're a bot. YouTube can then link what you watch \
+             to that account. Firefox works most reliably.",
         );
         playback.add(&quality_row);
         playback.add(&resume_row);
         playback.add(&external_row);
-        playback.add(&cookies_row);
+        playback.add(&sign_in_row);
 
         let browsing = adw::PreferencesGroup::builder().title("Browsing").build();
         let smooth_row = switch_row("Smooth wheel scrolling", "Glide with each wheel notch instead of jumping", smooth_scrolling);
@@ -2100,7 +2161,6 @@ impl Win {
             let minutes = REFRESH_CHOICES[(row.selected() as usize).min(REFRESH_CHOICES.len() - 1)].0;
             this.store.borrow_mut().refresh_minutes = Some(minutes);
             this.save_later();
-            this.schedule_refresh();
         });
         let this = self.clone();
         quality_row.connect_selected_notify(move |row| {
@@ -2117,11 +2177,9 @@ impl Win {
         let this = self.clone();
         external_row.connect_active_notify(move |row| this.set_toggle("external-player", row.is_active()));
         let this = self.clone();
-        cookies_row.connect_selected_notify(move |row| {
-            let browser = BROWSERS[(row.selected() as usize).min(BROWSERS.len() - 1)].0.map(str::to_string);
-            tools::set_cookies_browser(browser.clone());
-            this.store.borrow_mut().cookies_browser = browser;
-            this.save_later();
+        sign_in_row.connect_selected_notify(move |row| {
+            let key = choices.get(row.selected() as usize).and_then(|(key, _)| key.clone());
+            this.use_sign_in(key);
         });
         let this = self.clone();
         smooth_row.connect_active_notify(move |row| {
@@ -2148,6 +2206,99 @@ impl Win {
         toast
     }
 
+    /// Says what YouTube refused, in plain words, with the way to a browser
+    /// sign-in; `otherwise` for any other failure.
+    fn toast_refusal(&self, reason: &str, sign_in: Option<&tools::Browser>, otherwise: &str) {
+        let Some(explained) = util::explain_ytdlp(reason, sign_in) else {
+            self.toast(otherwise);
+            return;
+        };
+        let toast = self.toast(&explained.title);
+        toast.set_button_label(Some("Choose a browser…"));
+        toast.set_action_name(Some("win.sign-in"));
+        toast.set_timeout(10);
+    }
+
+    /// The choices for the browser sign-in: off, the browsers set up here,
+    /// and the chosen one even if it has since gone.
+    fn sign_in_choices(&self) -> Vec<(Option<String>, String)> {
+        let chosen = self.store.borrow().cookies_browser.clone();
+        let mut browsers = tools::browsers();
+        if let Some(key) = chosen.as_deref() {
+            if !browsers.iter().any(|browser| browser.key == key) {
+                browsers.push(tools::browser(key));
+            }
+        }
+        std::iter::once((None, "Off".to_string()))
+            .chain(browsers.into_iter().map(|browser| (Some(browser.key), browser.name)))
+            .collect()
+    }
+
+    /// Asks which browser's YouTube sign-in to borrow; reached from YouTube's
+    /// refusals. Preferences has the same setting.
+    fn sign_in_dialog(self: &Rc<Self>) {
+        let current = self.store.borrow().cookies_browser.clone();
+        let chosen = Rc::new(RefCell::new(current.clone()));
+        let list = gtk::ListBox::new();
+        list.add_css_class("boxed-list");
+        list.set_selection_mode(gtk::SelectionMode::None);
+        let mut group: Option<gtk::CheckButton> = None;
+        for (key, name) in self.sign_in_choices() {
+            let check = gtk::CheckButton::new();
+            check.set_group(group.as_ref());
+            check.set_active(key == current);
+            let picked = chosen.clone();
+            check.connect_toggled(move |check| {
+                if check.is_active() {
+                    *picked.borrow_mut() = key.clone();
+                }
+            });
+            let row = adw::ActionRow::builder()
+                .title(name)
+                .use_markup(false)
+                .activatable_widget(&check)
+                .build();
+            row.add_prefix(&check);
+            list.append(&row);
+            group.get_or_insert(check);
+        }
+        let dialog = adw::AlertDialog::new(
+            Some("Use a browser's YouTube sign-in"),
+            Some(
+                "Sign in to YouTube in one of these browsers, then choose it here. Firefox works most \
+                 reliably.\n\nMatinee uses that sign-in to play videos, and YouTube can then link what \
+                 you watch to that account. A spare Google account works just as well.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+        dialog.set_extra_child(Some(&list));
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if dialog.choose_future(Some(&this.window)).await.as_str() == "save" {
+                let key = chosen.borrow().clone();
+                this.use_sign_in(key);
+            }
+        });
+    }
+
+    /// Borrows the YouTube sign-in of the browser Preferences calls `key`, or
+    /// stops. Whatever failed for want of it tries again.
+    fn use_sign_in(self: &Rc<Self>, key: Option<String>) {
+        tools::set_sign_in(key.as_deref());
+        self.store.borrow_mut().cookies_browser = key;
+        self.save_later();
+        self.watch.sign_in_changed();
+        let view = self.view.borrow().clone();
+        if let View::Channel(id) = view {
+            if !self.history_done.borrow().contains(&id) && !self.history_running(&id) {
+                self.start_history(&id, false);
+            }
+        }
+    }
+
     fn about(&self) {
         let about = adw::AboutDialog::builder()
             .application_name("Matinee")
@@ -2165,8 +2316,8 @@ impl Win {
 }
 
 fn watch_hooks(weak: &Weak<Win>) -> WatchHooks {
-    let (started, stopped, pop_out, volume, quality) =
-        (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
+    let (started, stopped, pop_out, volume, quality, sign_in) =
+        (weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone(), weak.clone());
     WatchHooks {
         started: Box::new(move |video: &Video| {
             if let Some(win) = started.upgrade() {
@@ -2193,6 +2344,11 @@ fn watch_hooks(weak: &Weak<Win>) -> WatchHooks {
             if let Some(win) = quality.upgrade() {
                 win.store.borrow_mut().quality = chosen;
                 win.save_later();
+            }
+        }),
+        choose_sign_in: Box::new(move || {
+            if let Some(win) = sign_in.upgrade() {
+                win.sign_in_dialog();
             }
         }),
     }

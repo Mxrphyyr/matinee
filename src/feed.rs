@@ -5,6 +5,7 @@ use crate::model::{is_video_id, Channel, Video};
 use crate::{net, util};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 pub struct ChannelFeed {
     pub channel: Channel,
@@ -25,35 +26,41 @@ pub fn fetch_channel(channel_id: &str) -> Result<ChannelFeed, String> {
     parse(&net::get_text(&feed_url(channel_id))?)
 }
 
-/// Fetches every channel, eight at a time. Blocking: run it off the UI thread.
-pub fn fetch_all(channels: &[Channel]) -> Report {
-    const WORKERS: usize = 8;
+/// Fetches every channel. Blocking: run it off the UI thread. A first load
+/// goes eight channels at a time; `gentle` checks go four at a time with a
+/// pause after each, so hundreds of subscriptions never reach YouTube as
+/// one burst (bursts are what make it start asking whether you're a bot).
+pub fn fetch_all(channels: &[Channel], gentle: bool) -> Report {
+    let (workers, pause) = if gentle { (4, Duration::from_millis(250)) } else { (8, Duration::ZERO) };
     let next = AtomicUsize::new(0);
     let report = Mutex::new(Report::default());
     std::thread::scope(|scope| {
-        for _ in 0..WORKERS.min(channels.len()) {
+        for _ in 0..workers.min(channels.len()) {
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(channel) = channels.get(i) else { break };
                 let result = fetch_channel(&channel.id);
-                let mut report = report.lock().unwrap();
-                match result {
-                    Ok(mut feed) => {
-                        // Key everything by the id we subscribed with.
-                        feed.channel.id = channel.id.clone();
-                        if feed.channel.name.is_empty() {
-                            feed.channel.name = channel.name.clone();
-                        }
-                        for v in &mut feed.videos {
-                            v.channel_id = channel.id.clone();
-                            if v.channel_name.is_empty() {
-                                v.channel_name = feed.channel.name.clone();
+                {
+                    let mut report = report.lock().unwrap();
+                    match result {
+                        Ok(mut feed) => {
+                            // Key everything by the id we subscribed with.
+                            feed.channel.id = channel.id.clone();
+                            if feed.channel.name.is_empty() {
+                                feed.channel.name = channel.name.clone();
                             }
+                            for v in &mut feed.videos {
+                                v.channel_id = channel.id.clone();
+                                if v.channel_name.is_empty() {
+                                    v.channel_name = feed.channel.name.clone();
+                                }
+                            }
+                            report.feeds.push(feed);
                         }
-                        report.feeds.push(feed);
+                        Err(e) => report.failed.push((channel.clone(), e)),
                     }
-                    Err(e) => report.failed.push((channel.clone(), e)),
                 }
+                std::thread::sleep(pause);
             });
         }
     });

@@ -29,9 +29,10 @@ pub const APP_ID: &str = "io.github.matinee.Matinee";
 fn main() -> glib::ExitCode {
     // Video is drawn with OpenGL. GTK's OpenGL renderer composites it directly;
     // other renderers copy every frame between graphics APIs, which costs the
-    // most at full screen. A GSK_RENDERER set by the user still wins.
+    // most at full screen. A GSK_RENDERER set by the user still wins. GTK 4.18
+    // renamed that renderer from "ngl" to "gl" (before, "gl" was an older one).
     if std::env::var_os("GSK_RENDERER").is_none() {
-        std::env::set_var("GSK_RENDERER", "ngl");
+        std::env::set_var("GSK_RENDERER", if gtk::minor_version() >= 18 { "gl" } else { "ngl" });
     }
     let app = adw::Application::builder().application_id(APP_ID).build();
 

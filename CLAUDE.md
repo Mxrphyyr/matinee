@@ -30,8 +30,9 @@ YouTube extraction.
 - Install only into `~/.local`, never `/usr`; moss manages the system.
 - **Be gentle with YouTube.** Bursts of requests make YouTube answer "Sign in
   to confirm you're not a bot" for the owner's whole connection (this
-  happened with 0.3.0). Never fetch more than the user is about to see; keep
-  `--sleep-requests` on bulk reads.
+  happened with 0.3.0 and again before 0.3.2; the owner follows 271
+  channels). Never fetch more than the user is about to see; keep
+  `--sleep-requests` on bulk reads and the pauses in feed checks.
 - **No CSS `filter` or blur anywhere.** Blur caused every past stutter (feed
   scrolling, full-screen video, the page slide).
 - UI text is plain, friendly and in sentence case. Explain problems in
@@ -40,7 +41,8 @@ YouTube extraction.
 
 ## Commands
 
-- `cargo build`, `cargo test` (18 unit tests of pure logic; no display needed)
+- `cargo build`, `cargo test` (26 unit tests of pure logic; no display needed).
+  AerynOS has no GNU `ar`: plain cargo needs `AR=llvm-ar` (install.sh sets it).
 - `cargo run` opens the app on the owner's desktop
 - `./install.sh`: release build, installed into ~/.local (maps cc/ar/ld to
   clang/llvm-ar/lld when GNU tools are missing). `--check`, `--uninstall`.
@@ -68,21 +70,22 @@ which detects the prebuilt binary and checks libraries before installing.
 
 | File | What it does |
 |---|---|
-| `main.rs` | entry point; sets `GSK_RENDERER=ngl` unless the user set one; shortcuts |
+| `main.rs` | entry point; picks GTK's OpenGL renderer (`GSK_RENDERER=gl` on GTK 4.18+, `ngl` before) unless the user set one; shortcuts |
 | `window.rs` | main window: sidebar drawer (filter, foldable Channels, Trending), feed grid, channel history, search, Preferences, saving |
 | `card.rs`, `thumb.rs` | recyclable feed card; `ThumbPaintable` draws fade, zoom, dim and progress in `snapshot` (no relayout) |
 | `thumbs.rs` | thumbnail loader: 6 workers, newest-first queue, cancellation, 120-image memory cache |
 | `smooth.rs` | smooth wheel scrolling (exponential glide that follows the grid's own corrections) |
 | `watch.rs` | embedded player: `Surface` (GLArea plus the one mpv renderer), picture in picture, quality menu, controls, errors |
 | `mpv.rs` | libmpv FFI: client API and OpenGL render API, EGL/GLX proc lookup |
-| `feed.rs` | channel RSS (Atom) feeds, 8 in parallel |
-| `history.rs` | a channel's older uploads from yt-dlp, read on demand (60 per request) |
+| `feed.rs` | channel RSS (Atom) feeds: 8 at once on a first load, later 4 at once with pauses |
+| `history.rs` | a channel's older uploads from yt-dlp, read on demand (60 per request); reports yt-dlp's error |
 | `trending.rs` | Trending ranking (subscriptions only) |
 | `search.rs` | yt-dlp search and flat-entry parsing |
 | `resolve.rs` | channel ids from links and @handles; Takeout, NewPipe, FreeTube and OPML import |
 | `store.rs` | `~/.local/share/matinee/state.json`; every field has a serde default |
-| `tools.rs` | finds yt-dlp (prefers ~/.local/bin) and mpv; options shared by every yt-dlp run |
-| `player.rs` | external mpv ("Open in mpv") |
+| `tools.rs` | finds yt-dlp (prefers ~/.local/bin) and mpv; browser detection and the sign-in arguments |
+| `util.rs` | formatting helpers; `explain_ytdlp` turns yt-dlp errors into plain words |
+| `player.rs` | external mpv ("Open in mpv"); reads mpv's output to explain failures |
 | `style.rs`, `data/style.css` | light/dark palette and all CSS (embedded at build time) |
 | `icons.rs` | fallback symbolic icons for themes that lack them |
 
@@ -94,6 +97,12 @@ which detects the prebuilt binary and checks libraries before installing.
   re-estimate rows and jump while scrolling. Thumbnails are requested for
   cards within one screen (that pass runs at most every 80 ms) and dropped
   beyond three screens.
+- **Checking for new uploads.** Automatic checks happen only while the feed
+  is on screen in the focused window (a 60 s tick, window focus, and leaving
+  the player all call `refresh_if_due`), at most every `refresh_minutes`
+  (default 20). `last_refresh` survives restarts, so reopening Matinee
+  doesn't refetch every channel. Watched marks and resume points are pruned
+  only for videos leaving the feed (`Store::forget_leaving`).
 - **Player.** mpv renders into a `GtkGLArea` through the render API. libmpv
   allows one render context per mpv handle, so picture in picture moves it:
   set `vid=no`, free the old context with its GL context current, create the
@@ -105,17 +114,30 @@ which detects the prebuilt binary and checks libraries before installing.
   is inhibited during playback; `audio-fallback-to-null=yes`. Hardware
   decoding is `auto-copy-safe`; zero-copy interop only with
   `MATINEE_HWDEC_INTEROP=1` (it gave decode artifacts in testing).
-- **Quality.** `ytdl-format` is set per load. "Match my screen" (the default)
-  uses the monitor's physical height: at least 2000 px gives 2160, at least
-  1350 gives 1440, otherwise 1080. Changing quality reloads from the current
-  position.
+- **Quality.** `ytdl-format` is set per load, for the embedded player and the
+  external mpv alike. "Match my screen" (the default) uses the monitor's
+  physical height (logical height times the surface's fractional scale): at
+  least 2000 px gives 2160, at least 1350 gives 1440, otherwise 1080.
+  Changing quality reloads from the current position.
 - **yt-dlp.** Used for playback (mpv's ytdl_hook), "Open in mpv", search,
   channel lookup and channel history. Recommended setup on the owner's
   machine: the standalone `yt-dlp_linux` in ~/.local/bin (update with
   `~/.local/bin/yt-dlp -U`) plus Deno in ~/.local/bin, with
   `--js-runtimes deno:$HOME/.local/bin/deno` in `~/.config/yt-dlp/config`;
-  current yt-dlp needs a JavaScript runtime for YouTube. The optional browser
-  sign-in (Preferences, Playback) adds `--cookies-from-browser` to every run.
+  current yt-dlp needs a JavaScript runtime for YouTube.
+- **Browser sign-in.** When YouTube refuses a connection, every player type
+  answers LOGIN_REQUIRED; only a signed-in request gets through. The sign-in
+  is borrowed from a browser (Preferences, Playback, or "Choose a browser…"
+  on the player's problem card and on toasts): `--cookies-from-browser` for
+  playback, embedded and external. Search and channel history go without it
+  and retry with it only after a bot check, since a signed-in search lands in
+  the account's search history. `tools::BROWSERS` maps each browser to its
+  profile folders; Flatpak and Snap installs and Firefox forks are passed as
+  `family:/path`, and mpv gets the value length-quoted (`%n%`). Firefox is
+  the reliable one: Chromium browsers encrypt sign-ins with the desktop's
+  password store. The owner's browsers are mostly Flatpaks. Claude must not
+  read browser cookie stores itself (the safety check blocks it, rightly);
+  the owner verifies sign-in by playing a video.
 - **Trending.** YouTube retired its public Trending page in 2025, so Trending
   ranks subscription uploads from the last 14 days by
   `ln((views+10)/(expected+10)) - 0.07*days + 0.12*log10(views+1)`, where
@@ -131,9 +153,22 @@ picture. During the original build Claude worked in a sandbox with Xvfb,
 software OpenGL and a mock YouTube; software GL showed artifacts real GPUs
 don't, so trust the owner's machine over sandbox screenshots.
 
+To see the UI without disturbing the owner's desktop or data, run it in an
+invisible KWin: `dbus-run-session -- kwin_wayland --virtual --socket NAME
+--width 1600 --height 1400 --no-lockscreen --exit-with-session SCRIPT`, with
+`HOME` and the `XDG_*` folders pointed at a throwaway directory holding a
+hand-made `state.json` (set `last_refresh` to now so it fetches nothing).
+Inside SCRIPT, start `target/debug/matinee`, trigger window actions with
+`gdbus call --session --dest io.github.matinee.Matinee --object-path
+/io/github/matinee/Matinee/window/1 --method org.gtk.Actions.Activate
+play "[<'VIDEO_ID'>]" '{}'` (or `preferences`, `sign-in`, `show-channel`),
+and capture with `spectacle -b -n -f -o shot.png`.
+
 ## Ideas not done yet
 
 - An in-app "Update yt-dlp" button (download yt-dlp_linux into ~/.local/bin).
+- A PO token provider (the bgutil yt-dlp plugin) might let playback through
+  without a sign-in; untested, and another moving part to maintain.
 - Link the About dialog to the repository; the app id could become
   `io.github.Mxrphyyr.Matinee`.
 - ARM64 release builds; a Flatpak.

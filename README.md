@@ -7,9 +7,11 @@
 A private, ad-free desktop app for following YouTube channels on Linux.
 Written in Rust with GTK 4 and libadwaita.
 
-- **No account, no ads, no tracking.** Matinee never signs in to Google. New
-  videos come from YouTube's public per-channel feeds, and videos play right
-  in the window through libmpv, the engine inside mpv.
+- **No account, no ads, no tracking.** Matinee doesn't need a Google account.
+  New videos come from YouTube's public per-channel feeds, and videos play
+  right in the window through libmpv, the engine inside mpv. (If YouTube ever
+  insists on a sign-in, Matinee can borrow your browser's, but only if you
+  turn that on.)
 - **Your subscriptions, brought over once.** Import from Google Takeout,
   NewPipe, FreeTube or OPML, or add channels by link or `@handle`.
 - **Made to feel alive.** Feeds arrive in a diagonal wave and thumbnails
@@ -51,6 +53,7 @@ Written in Rust with GTK 4 and libadwaita.
 | libmpv, with development files | plays video inside the window | 2.0 (mpv 0.35) |
 | mpv | only for "Open in mpv" | any recent |
 | yt-dlp | lets mpv stream from YouTube, and powers search | keep it current |
+| Deno | runs YouTube's JavaScript for yt-dlp, which needs it to play videos | any recent |
 
 Matinee itself never touches `/usr`. The install script puts everything under
 your home folder (`~/.local`), which suits AerynOS's moss-managed system.
@@ -123,6 +126,23 @@ chmod +x ~/.local/bin/yt-dlp
 Matinee looks for yt-dlp in `~/.local/bin` even when that folder isn't on
 your `PATH`, and passes its location to mpv.
 
+Current yt-dlp also needs Deno, a JavaScript runtime, to play YouTube videos.
+Its standalone build goes in the same folder:
+
+```sh
+curl -L https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip \
+     -o /tmp/deno.zip
+unzip -o /tmp/deno.zip -d ~/.local/bin
+```
+
+Then tell yt-dlp where Deno is, since apps opened from the launcher may not
+have `~/.local/bin` on their `PATH`:
+
+```sh
+mkdir -p ~/.config/yt-dlp
+echo "--js-runtimes deno:$HOME/.local/bin/deno" >> ~/.config/yt-dlp/config
+```
+
 ### 2d. Build and install Matinee
 
 Unpack the project and run the installer from inside its folder:
@@ -168,7 +188,7 @@ different from GNOME:
 - **Light or dark.** Matinee follows the color scheme Plasma reports. With a
   dark scheme such as Breeze Dark you get the dark aubergine-and-gold look;
   with a light scheme you get the light version. To keep it dark regardless,
-  turn on **Always use dark style** in Matinee's main menu.
+  turn on **Always use dark style** in Matinee's Preferences.
 - **Icons.** Matinee uses your Breeze icons. For any icon Breeze doesn't have,
   it falls back to small built-in icons, so you won't see broken images.
 - **File picker.** The import dialog is GTK's. For Plasma's own file dialog,
@@ -307,8 +327,9 @@ rule in System Settings → Window Management → Window Rules: match the window
 title **Picture in picture** (and class `io.github.matinee.Matinee`), then add
 the property **Keep above other windows: Force, Yes**.
 
-If a video can't play, the player says why, using yt-dlp's own explanation,
-and offers **Try again** and **Open in mpv**.
+If a video can't play, the player says why and offers **Try again** and
+**Open in mpv**. When YouTube wants a sign-in, it offers **Choose a
+browser…** instead (see [section 7](#7-keeping-playback-working)).
 
 ### Labels on thumbnails
 
@@ -325,31 +346,39 @@ and offers **Try again** and **Open in mpv**.
 
 - **Import subscriptions…**
 - **Hide Shorts:** removes Shorts from the feed, channel pages and search.
-- **Always use dark style:** ignores the system's light/dark setting.
-- **Always play in a separate window:** opens videos in mpv's own window
-  instead of inside Matinee.
+- **Preferences:** dark style, card size, how often to check for new videos,
+  video quality, playing in a separate window, a browser's YouTube sign-in,
+  and more (see the end of this page).
 - **About Matinee**
 
-Matinee checks for new uploads when it starts and every 20 minutes while open.
+Matinee checks for new uploads when it starts (unless it checked in the last
+20 minutes) and every 20 minutes after that, but only while your feed is on
+screen. It asks YouTube for nothing while a video plays or while Matinee is in
+the background, and catches up when you come back. Preferences sets how often.
 
 ---
 
 ## 6. What Matinee sends over the network
 
-Matinee sends no account details, API keys or analytics. Here is every kind of
-request it makes:
+Matinee sends no API keys or analytics, and no account details unless you
+choose to (see below). Here is every kind of request it makes:
 
 | Request | When | Goes to |
 |---|---|---|
-| A channel's public feed (`/feeds/videos.xml`) | at start, every 20 minutes, and on Refresh | youtube.com |
+| A channel's public feed (`/feeds/videos.xml`) | at start and every 20 minutes while your feed is on screen, and on Refresh | youtube.com |
 | Thumbnails | when a video first appears; cached on disk for 30 days | i.ytimg.com |
 | A channel's public page | only when you add a channel by link or `@handle` | youtube.com |
+| A channel's Videos tab | when you open a channel, a page at a time as you scroll, through yt-dlp | youtube.com |
 | Search | when you search, through yt-dlp | youtube.com |
-| Video streams | when you play, through libmpv and yt-dlp | googlevideo.com |
+| A video's details and streams | when you play, through yt-dlp and libmpv | youtube.com, googlevideo.com |
 
 The only cookie sent is `SOCS=CAI`, which *declines* YouTube's cookie-consent
-prompt in the EU. Videos never load YouTube's web player, so there are no ads
-and no watch-time reporting.
+prompt in the EU, unless you turn on a browser's YouTube sign-in
+([section 7](#7-keeping-playback-working)). Then playing a video also sends
+that browser's YouTube cookies, so YouTube can link what you watch to that
+account; searches and channel pages go without them unless YouTube refuses to
+answer. Videos never load YouTube's web player, so there are no ads and no
+watch-time reporting.
 
 What this can't hide: YouTube's servers still see your IP address, as with any
 website. Use a VPN or Tor if that matters to you.
@@ -375,18 +404,37 @@ sudo moss sync -u        # if yt-dlp came from moss
 yt-dlp -U                # if you installed the standalone build in ~/.local/bin
 ```
 
+### "YouTube wants to check you're not a bot"
+
+YouTube sometimes stops playing videos for a whole internet connection until
+someone signs in, usually after lots of requests from it, or on a VPN. It
+stops by itself after a while, and updating yt-dlp doesn't help. To watch
+meanwhile, let Matinee borrow a browser's YouTube sign-in:
+
+1. Sign in to YouTube in a web browser. Firefox works best: browsers built on
+   Chrome lock their sign-ins away, which can stop Matinee reading them. A
+   spare Google account works just as well as your main one.
+2. In the player, click **Choose a browser…** (or open Preferences, then
+   **Use a browser's YouTube sign-in** under Playback), pick that browser and
+   click **Save**. The video tries again by itself.
+
+Matinee lists only the browsers it finds on your computer, including Flatpak
+and Snap installs. It uses the sign-in to play videos; searches and channel
+pages go without it unless YouTube refuses to answer. YouTube can then link
+what you watch to that account. Choose **Off** to stop.
+
 ---
 
 ## 8. Settings and environment variables
 
-Everything day-to-day is in the main menu. These variables are for special
-setups:
+Everything day-to-day is in the main menu and Preferences. These variables
+are for special setups:
 
 | Variable | Effect |
 |---|---|
 | `MATINEE_PLAYER` | Use another player, e.g. `celluloid`, `mpv --fs`, or `flatpak run io.mpv.Mpv`. The video link is added at the end. |
 | `GDK_DEBUG=portals` | Use Plasma's own file dialog for importing. |
-| `GSK_RENDERER` | Matinee uses GTK's OpenGL renderer (`ngl`) because video is drawn with OpenGL; set `vulkan` to use GTK's default instead. |
+| `GSK_RENDERER` | Matinee uses GTK's OpenGL renderer (`gl`, called `ngl` before GTK 4.18) because video is drawn with OpenGL; set `vulkan` to use GTK's default instead. |
 | `MATINEE_HWDEC_INTEROP=1` | Experimental: zero-copy hardware decoding, which hands decoded frames straight to the GPU. |
 | `MATINEE_FEED_BASE`, `MATINEE_THUMB_BASE` | Fetch feeds or thumbnails through a mirror or proxy that copies YouTube's paths. Mainly for testing. |
 
@@ -454,17 +502,21 @@ output usually explains the problem:
 mpv 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
 ```
 
+**"YouTube wants to check you're not a bot."**
+YouTube won't play videos for your internet connection without a sign-in for
+now. Section 7 shows how to let Matinee borrow your browser's.
+
 **Full-screen video stutters.**
 Matinee draws video with OpenGL and uses GTK's OpenGL renderer so frames
 aren't copied between graphics systems. If you set `GSK_RENDERER` yourself,
-try removing it or setting `GSK_RENDERER=ngl`. You can also try
-`MATINEE_HWDEC_INTEROP=1` (see section 8). If it still stutters, run
-`~/.local/bin/matinee` from Konsole and send the output.
+try removing it or setting `GSK_RENDERER=gl` (`ngl` before GTK 4.18). You
+can also try `MATINEE_HWDEC_INTEROP=1` (see section 8). If it still
+stutters, run `~/.local/bin/matinee` from Konsole and send the output.
 
 **The player says "Video can't be shown here".**
 Matinee draws video with OpenGL, and it isn't working on this system, which
-can happen with some older or virtual graphics drivers. Turn on **Always play
-in a separate window** in the main menu to use mpv's own window instead.
+can happen with some older or virtual graphics drivers. Turn on **Play in a
+separate window** in Preferences to use mpv's own window instead.
 
 **The build stops with "Matinee needs libmpv".**
 Install libmpv's development files: `sudo moss install 'pkgconfig(mpv)'`.
@@ -484,7 +536,7 @@ No channel loaded at all. Check your connection, VPN or firewall.
 Run `kbuildsycoca6` (rebuilds Plasma's menu), or log out and back in.
 
 **Matinee looks light but I wanted dark.**
-Turn on **Always use dark style** in the main menu, or pick a dark color
+Turn on **Always use dark style** in Preferences, or pick a dark color
 scheme in Plasma.
 
 **Thumbnails look wrong after a channel changes them.**
@@ -562,7 +614,7 @@ cargo test           # parser and formatting tests
 | `src/icons.rs` | fallback icons for themes that lack some |
 | `src/player.rs` | launching mpv in a separate window |
 | `src/store.rs` | the local state file |
-| `src/tools.rs` | finding yt-dlp outside `PATH` |
+| `src/tools.rs` | finding yt-dlp outside `PATH`, and browsers to borrow a YouTube sign-in from |
 
 The motion design is documented at the top of `data/style.css`.
 
@@ -596,9 +648,10 @@ public Trending page in 2025, so there is no global list to show.)
 **Video quality.** The button beside the speed shows what's playing (720p,
 1080p, 4K) and lets you pick another; the video reloads from the same moment.
 **Match my screen**, the default, streams up to your monitor's resolution, so
-a 4K monitor gets 4K. 4K streams are VP9 or AV1, which want hardware decoding
-for smooth playback.
+a 4K monitor gets 4K, in mpv's separate window too. 4K streams are VP9 or
+AV1, which want hardware decoding for smooth playback.
 
 **Preferences** (main menu, or **Ctrl+,**): dark style, card size, Hide
 Shorts, how often to check for new videos, default quality, resuming, playing
-in a separate window, smooth scrolling, and the channel list.
+in a separate window, a browser's YouTube sign-in, smooth scrolling, and the
+channel list.

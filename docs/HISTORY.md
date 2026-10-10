@@ -79,3 +79,40 @@ the reasons.
   ~/.local/bin (current yt-dlp needs a JavaScript runtime for YouTube).
 - Development then moved to Claude Code, with `CLAUDE.md` and this file
   carrying the context over.
+
+## 0.3.2: the bot check, part two (Claude Code)
+
+- Playback still failed with "Sign in to confirm you're not a bot". Tested
+  from the owner's machine: every player type yt-dlp can ask for (visionos,
+  web, web_safari, tv, tv_simply, mweb, web_embedded, android_vr) answered
+  LOGIN_REQUIRED or UNPLAYABLE, even for a 2005 video. So no setting or
+  yt-dlp update gets around it (2026.08.19 was the latest release). Search
+  and channel listings still worked without a sign-in.
+- Likely contributor: the owner follows 271 channels, and Matinee checked
+  every feed at launch and every 20 minutes, eight at once: about 800
+  requests an hour while open. Now checks run only while the feed is on
+  screen, the last check time survives restarts, and checks after the
+  first load go four at a time with pauses.
+- The 0.3.1 sign-in only knew where regular installs keep their profiles,
+  and most of the owner's browsers are Flatpaks. Matinee now finds regular,
+  Flatpak and Snap installs and Firefox forks, lists only those, and points
+  yt-dlp at the right folder. Firefox is recommended: Chromium browsers
+  encrypt sign-ins with the desktop's password store.
+- The sign-in is used for playback. Search and channel pages ask without
+  it first, because a signed-in search lands in the account's history.
+- Refusals are explained with a "Choose a browser…" button (player and
+  toasts), including failures in mpv's own window.
+- Bugs fixed: resume points and watched marks of videos outside the feed
+  were erased at every refresh; a failed channel-history read counted as
+  complete, so it never retried; the separate mpv window ignored the quality
+  setting and marked videos watched even when they never played; "Match my
+  screen" overestimated with fractional scaling; a damaged cached thumbnail
+  never reloaded; GTK 4.18+ warned that `ngl` is now called `gl`.
+- Claude tested the UI in an invisible KWin session with a throwaway home
+  folder (see CLAUDE.md, Testing). It did not read the owner's browser
+  cookie stores; the owner checks the sign-in by playing a video.
+- The owner chose Firefox and playback worked again, while YouTube still
+  refused the same connection without a sign-in. No prompt appears: yt-dlp
+  reads Firefox's saved sign-in each time.
+- The README gained the bot-check steps (section 7) and Deno, which current
+  yt-dlp needs for YouTube.

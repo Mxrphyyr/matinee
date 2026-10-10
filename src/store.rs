@@ -52,9 +52,13 @@ pub struct Store {
     pub no_smooth_scroll: bool,
     #[serde(default)]
     pub no_resume: bool,
-    /// The browser whose YouTube sign-in yt-dlp may borrow; None means never.
+    /// The browser whose YouTube sign-in yt-dlp may borrow (a key from
+    /// `tools`, such as "firefox"); None means never.
     #[serde(default)]
     pub cookies_browser: Option<String>,
+    /// When the feed was last checked for new uploads, in Unix seconds.
+    #[serde(default)]
+    pub last_refresh: Option<i64>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -99,11 +103,56 @@ impl Store {
         }
     }
 
+    /// Forgets the watched marks and resume points of videos that are in the
+    /// feed now but not in `next`. Those of videos that were never in the
+    /// feed (search results, a channel's older uploads) stay.
+    pub fn forget_leaving(&mut self, next: &[Video]) {
+        let staying: HashSet<&str> = next.iter().map(|v| v.id.as_str()).collect();
+        let leaving: HashSet<String> = self
+            .feed
+            .iter()
+            .filter(|v| !staying.contains(v.id.as_str()))
+            .map(|v| v.id.clone())
+            .collect();
+        self.watched.retain(|id| !leaving.contains(id));
+        self.progress.retain(|id, _| !leaving.contains(id));
+    }
+
     pub fn is_subscribed(&self, channel_id: &str) -> bool {
         self.channels.iter().any(|c| c.id == channel_id)
     }
 
     pub fn channel_name(&self, channel_id: &str) -> Option<String> {
         self.channels.iter().find(|c| c.id == channel_id).map(|c| c.name.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn video(id: &str) -> Video {
+        Video { id: id.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn keeps_resume_points_of_videos_outside_the_feed() {
+        let mut store = Store { feed: vec![video("stays"), video("leaves")], ..Default::default() };
+        for id in ["stays", "leaves", "searched"] {
+            store.watched.insert(id.to_string());
+            store.progress.insert(id.to_string(), [60.0, 600.0]);
+        }
+        store.forget_leaving(&[video("stays"), video("arrives")]);
+        let mut kept: Vec<&String> = store.progress.keys().collect();
+        kept.sort();
+        assert_eq!(kept, ["searched", "stays"]);
+        assert!(store.watched.contains("searched") && !store.watched.contains("leaves"));
+    }
+
+    #[test]
+    fn older_state_files_still_load() {
+        let store: Store = serde_json::from_str(r#"{"channels":[],"cookies_browser":"chrome"}"#).unwrap();
+        assert_eq!(store.cookies_browser.as_deref(), Some("chrome"));
+        assert_eq!(store.last_refresh, None);
     }
 }

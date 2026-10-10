@@ -2,8 +2,9 @@
 //! updated within days whenever YouTube changes its internals.
 
 use crate::model::{is_video_id, Video};
+use crate::{tools, util};
 use serde::Deserialize;
-use std::process::Command;
+use std::process::{Command, Output};
 
 #[derive(Deserialize)]
 struct Playlist {
@@ -27,32 +28,43 @@ struct Entry {
 }
 
 pub fn search(query: &str, limit: usize) -> Result<Vec<Video>, String> {
-    let output = Command::new(crate::tools::yt_dlp())
-        .args(["--flat-playlist", "--dump-single-json", "--no-warnings", "--quiet"])
-        .args(crate::tools::yt_dlp_args())
-        .arg(format!("ytsearch{limit}:{query}"))
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "Search needs yt-dlp. Install it from your package manager, then search again.".to_string()
-            } else {
-                format!("Couldn't run yt-dlp: {e}")
-            }
-        })?;
+    // Searches go without the browser sign-in, which would add them to that
+    // account's search history, unless YouTube won't answer without one.
+    let mut output = run(query, limit, false)?;
+    let sign_in = tools::sign_in();
+    if !output.status.success() && sign_in.is_some() && util::is_bot_check(&error(&output)) {
+        output = run(query, limit, true)?;
+    }
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let last = stderr
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("no error message");
-        let last = last.trim();
-        if let Some((title, detail)) = crate::util::explain_ytdlp(last) {
-            return Err(format!("{title}. {detail}"));
+        let reason = error(&output);
+        if let Some(explained) = util::explain_ytdlp(&reason, sign_in.as_ref()) {
+            return Err(format!("{}. {}", explained.title, explained.detail));
         }
-        return Err(format!("yt-dlp couldn't search: {last}"));
+        return Err(format!("yt-dlp couldn't search: {reason}"));
     }
     parse(&output.stdout)
+}
+
+fn run(query: &str, limit: usize, signed_in: bool) -> Result<Output, String> {
+    let mut command = Command::new(tools::yt_dlp());
+    command.args(["--flat-playlist", "--dump-single-json", "--no-warnings", "--quiet"]);
+    if signed_in {
+        command.args(tools::sign_in_args());
+    }
+    command.arg(format!("ytsearch{limit}:{query}")).output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "Search needs yt-dlp. Install it from your package manager, then search again.".to_string()
+        } else {
+            format!("Couldn't run yt-dlp: {e}")
+        }
+    })
+}
+
+/// yt-dlp's explanation: the last thing it said.
+fn error(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no error message");
+    util::tidy_error(last)
 }
 
 pub fn parse(json: &[u8]) -> Result<Vec<Video>, String> {

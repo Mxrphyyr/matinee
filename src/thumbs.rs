@@ -146,19 +146,25 @@ impl Thumbs {
 
 fn load(dir: &Path, id: &str) -> Option<gdk::Texture> {
     let path = dir.join(format!("{id}.jpg"));
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) if !bytes.is_empty() => bytes,
-        _ => {
-            // hqdefault is 4:3 with letterbox bars; the card crops it to 16:9,
-            // which leaves a sharp 480px-wide image with the bars cut off.
-            let url = format!("{}/vi/{id}/hqdefault.jpg", crate::net::thumb_base());
-            let bytes = crate::net::get_bytes(&url).ok()?;
-            let _ = std::fs::write(&path, &bytes);
-            bytes
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Some(texture) = decode(&bytes) {
+            return Some(texture);
         }
-    };
-    // Texture decoding is thread-safe in GTK, so it stays off the UI thread.
-    gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+        // A damaged copy (say, from a write cut short) is fetched again.
+        let _ = std::fs::remove_file(&path);
+    }
+    // hqdefault is 4:3 with letterbox bars; the card crops it to 16:9,
+    // which leaves a sharp 480px-wide image with the bars cut off.
+    let url = format!("{}/vi/{id}/hqdefault.jpg", crate::net::thumb_base());
+    let bytes = crate::net::get_bytes(&url).ok()?;
+    let texture = decode(&bytes)?;
+    let _ = std::fs::write(&path, &bytes);
+    Some(texture)
+}
+
+/// Texture decoding is thread-safe in GTK, so it stays off the UI thread.
+fn decode(bytes: &[u8]) -> Option<gdk::Texture> {
+    gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).ok()
 }
 
 fn prune(dir: &Path) {

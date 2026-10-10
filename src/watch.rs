@@ -33,6 +33,8 @@ pub struct WatchHooks {
     pub volume_changed: Box<dyn Fn(f64)>,
     /// A quality was picked in the player; remember it for next time.
     pub quality_changed: Box<dyn Fn(Option<u32>)>,
+    /// The viewer wants to choose a browser whose YouTube sign-in to use.
+    pub choose_sign_in: Box<dyn Fn()>,
 }
 
 /// A place mpv can draw: the player page or the picture-in-picture window.
@@ -112,6 +114,10 @@ pub struct Watch {
     problem: gtk::Box,
     problem_title: gtk::Label,
     problem_detail: gtk::Label,
+    /// "Open in mpv", offered when the problem is this window's own.
+    elsewhere: gtk::Button,
+    /// Offered when a browser sign-in is the way past YouTube's refusal.
+    choose_browser: gtk::Button,
     top: gtk::Revealer,
     bottom: gtk::Revealer,
     title: gtk::Label,
@@ -200,11 +206,15 @@ impl Watch {
         retry.add_css_class("suggested-action");
         let elsewhere = gtk::Button::with_label("Open in mpv");
         elsewhere.add_css_class("pill");
+        let choose_browser = gtk::Button::with_label("Choose a browser…");
+        choose_browser.add_css_class("pill");
+        choose_browser.set_visible(false);
         let problem_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         problem_buttons.set_halign(gtk::Align::Center);
         problem_buttons.set_margin_top(8);
         problem_buttons.append(&retry);
         problem_buttons.append(&elsewhere);
+        problem_buttons.append(&choose_browser);
         let problem = gtk::Box::new(gtk::Orientation::Vertical, 10);
         problem.add_css_class("problem");
         problem.set_halign(gtk::Align::Center);
@@ -351,6 +361,8 @@ impl Watch {
             problem,
             problem_title,
             problem_detail,
+            elsewhere,
+            choose_browser,
             top,
             bottom,
             title,
@@ -397,18 +409,11 @@ impl Watch {
             resume_at: Cell::new(0.0),
             inhibit_cookie: Cell::new(0),
         });
-        watch.connect(&retry, &elsewhere, &pop_out, &top_bar, &controls);
+        watch.connect(&retry, &pop_out, &top_bar, &controls);
         watch
     }
 
-    fn connect(
-        self: &Rc<Self>,
-        retry: &gtk::Button,
-        elsewhere: &gtk::Button,
-        pop_out: &gtk::Button,
-        top_bar: &gtk::Box,
-        controls: &gtk::Box,
-    ) {
+    fn connect(self: &Rc<Self>, retry: &gtk::Button, pop_out: &gtk::Button, top_bar: &gtk::Box, controls: &gtk::Box) {
         // ── Buttons ──
         let on = |button: &gtk::Button, action: fn(&Rc<Watch>)| {
             let weak = Rc::downgrade(self);
@@ -433,7 +438,8 @@ impl Watch {
         on(&self.fullscreen, |w| w.toggle_fullscreen());
         on(&self.start_over, |w| w.start_over());
         on(retry, |w| w.retry());
-        on(elsewhere, |w| w.pop_out());
+        on(&self.elsewhere, |w| w.pop_out());
+        on(&self.choose_browser, |w| (w.hooks.choose_sign_in)());
         on(pop_out, |w| w.pop_out());
 
         let weak = Rc::downgrade(self);
@@ -837,7 +843,7 @@ impl Watch {
             self.show_problem(
                 "Video can't be shown here",
                 &format!(
-                    "OpenGL isn't available ({}). Turn on “Always play in a separate window” in the main menu.",
+                    "OpenGL isn't available ({}). Turn on “Play in a separate window” in Preferences.",
                     error.message()
                 ),
             );
@@ -869,7 +875,7 @@ impl Watch {
             Err(e) => {
                 self.show_problem(
                     "Video can't be shown here",
-                    &format!("mpv couldn't draw into the window ({e}). Turn on “Always play in a separate window” in the main menu."),
+                    &format!("mpv couldn't draw into the window ({e}). Turn on “Play in a separate window” in Preferences."),
                 );
                 false
             }
@@ -886,7 +892,7 @@ impl Watch {
         mpv.set_double("speed", SPEEDS[self.speed_index.get()]);
         mpv.set_string("ytdl-format", &self.format());
         // The browser sign-in, if it's turned on in Preferences.
-        mpv.set_string("ytdl-raw-options", &tools::mpv_raw_options());
+        mpv.set_string("ytdl-raw-options", &tools::mpv_sign_in());
         // Applies to this file only; reset once it has loaded.
         let start = self.resume_at.get();
         mpv.set_string("start", &if start > 0.0 { format!("{start:.1}") } else { "none".to_string() });
@@ -941,7 +947,7 @@ impl Watch {
                         && !hardware_probe
                         && (from_yt_dlp || self.last_error.borrow().is_empty())
                     {
-                        *self.last_error.borrow_mut() = tidy_error(text);
+                        *self.last_error.borrow_mut() = util::tidy_error(text);
                     }
                 }
                 Event::Shutdown => break,
@@ -1034,8 +1040,13 @@ impl Watch {
         }
         let reason = self.last_error.borrow().clone();
         let reason = if reason.is_empty() { mpv::error_string(code) } else { reason };
-        match util::explain_ytdlp(&reason) {
-            Some((title, detail)) => self.show_problem(title, detail),
+        match util::explain_ytdlp(&reason, tools::sign_in().as_ref()) {
+            Some(explained) => {
+                self.show_problem(&explained.title, &explained.detail);
+                // Another mpv window would meet the same refusal; a sign-in gets past it.
+                self.elsewhere.set_visible(false);
+                self.choose_browser.set_visible(true);
+            }
             None => self.show_problem(
                 "This video won't play",
                 &format!("{reason}\n\nUpdating yt-dlp usually fixes this."),
@@ -1047,10 +1058,20 @@ impl Watch {
         self.set_busy(false);
         self.problem_title.set_label(title);
         self.problem_detail.set_label(detail);
+        self.elsewhere.set_visible(true);
+        self.choose_browser.set_visible(false);
         self.problem.set_visible(true);
         self.top.set_reveal_child(true);
         self.bottom.set_reveal_child(false);
         self.stage.set_cursor(None);
+    }
+
+    /// A different browser sign-in (or none) was chosen: a video on screen
+    /// that couldn't play tries again with it.
+    pub fn sign_in_changed(self: &Rc<Self>) {
+        if self.shown.get() && self.problem.is_visible() {
+            self.retry();
+        }
     }
 
     fn retry(self: &Rc<Self>) {
@@ -1253,26 +1274,8 @@ impl Watch {
 
     /// yt-dlp's format choice for the current quality setting.
     fn format(&self) -> String {
-        let height = self.quality.get().unwrap_or_else(|| self.screen_height());
-        format!("bestvideo[height<=?{height}]+bestaudio/best[height<=?{height}]/best")
-    }
-
-    /// "Match my screen": the tallest common video size this monitor shows
-    /// pixel for pixel, and never less than 1080p.
-    fn screen_height(&self) -> u32 {
-        let window = self.window.borrow().upgrade();
-        let physical = window
-            .and_then(|window| {
-                let surface = window.surface()?;
-                WidgetExt::display(&window).monitor_at_surface(&surface)
-            })
-            .map(|monitor| monitor.geometry().height() * monitor.scale_factor())
-            .unwrap_or(1080);
-        match physical {
-            h if h >= 2000 => 2160,
-            h if h >= 1350 => 1440,
-            _ => 1080,
-        }
+        let height = self.quality.get().unwrap_or_else(|| screen_height(self.window.borrow().upgrade().as_ref()));
+        tools::ytdl_format(height)
     }
 
     fn video_off(&self) {
@@ -1547,6 +1550,25 @@ fn soften(texture: &gdk::Texture) -> Option<gdk::Texture> {
     Some(soft.upcast())
 }
 
+/// "Match my screen": the tallest common video size the monitor showing
+/// `window` displays pixel for pixel, and never less than 1080p.
+pub fn screen_height(window: Option<&gtk::Window>) -> u32 {
+    let physical = window
+        .and_then(|window| {
+            let surface = window.surface()?;
+            let monitor = WidgetExt::display(window).monitor_at_surface(&surface)?;
+            // The surface knows fractional scales (125%, 150%); the monitor's
+            // scale factor rounds them up, which would overstate the pixels.
+            Some((f64::from(monitor.geometry().height()) * surface.scale()).round() as i32)
+        })
+        .unwrap_or(1080);
+    match physical {
+        h if h >= 2000 => 2160,
+        h if h >= 1350 => 1440,
+        _ => 1080,
+    }
+}
+
 /// Zero-copy hardware decoding, opt-in until it's proven on more drivers.
 fn interop() -> bool {
     std::env::var_os("MATINEE_HWDEC_INTEROP").is_some_and(|v| v == "1")
@@ -1558,19 +1580,6 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     button.set_tooltip_text(Some(tooltip));
     button.set_valign(gtk::Align::Center);
     button
-}
-
-/// "ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm…" becomes "Sign in to confirm…".
-fn tidy_error(text: &str) -> String {
-    let text = text.rsplit("ERROR:").next().unwrap_or(text).trim();
-    let text = match text.strip_prefix('[') {
-        Some(rest) => rest.split_once("] ").map_or(rest, |(_, after)| after),
-        None => text,
-    };
-    match text.split_once(": ") {
-        Some((id, reason)) if crate::model::is_video_id(id) => reason.to_string(),
-        _ => text.to_string(),
-    }
 }
 
 const QUALITY_CHOICES: [(&str, &str); 6] = [
