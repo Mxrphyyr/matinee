@@ -201,6 +201,8 @@ different from GNOME:
   Settings, Default Applications.
 - **Volume mixer.** While a video plays, Plasma's volume applet lists it as
   *Matinee*.
+- **Media controls.** Matinee shows in Plasma's media player widget and
+  answers the keyboard's media keys (see section 5).
 - **Fractional scaling** (125%, 150%) is supported. Thumbnails are fetched at
   a resolution that stays sharp at those scales.
 
@@ -301,6 +303,9 @@ move the mouse.
 | J / L | Back / forward 10 seconds |
 | ↑ / ↓ | Volume |
 | M | Mute |
+| C | Subtitles on or off |
+| N / Shift+N | Next / previous video in the list you came from |
+| Page Down / Page Up | Next / previous chapter |
 | P | Picture in picture |
 | F, or double-click the picture | Full screen |
 | Esc | Leave full screen, then back to your feed |
@@ -314,6 +319,23 @@ window. Volume is remembered between sessions, and the player is listed as
 
 Leave a video partway and it resumes there next time; a **Start over**
 button appears beside the time for the first few seconds.
+
+**Chapters.** When a video has chapters, each one's start is a small tick on
+the seek bar and the current chapter's name sits beside the clock. Page Down
+and Page Up jump between them.
+
+**Subtitles.** The **CC** button (or **C**) shows YouTube's captions in your
+desktop's language, falling back to English, auto-generated ones included.
+Matinee remembers whether you want them.
+
+**Autoplay.** Turn on **Autoplay the next video** in Preferences and, when a
+video ends, an **Up next** card offers the next one in the list you were
+browsing, with eight seconds to say no. **N** plays the next video right away.
+
+**Media keys and Plasma's media controls.** While a video is open, Matinee
+appears in Plasma's media player widget (next to the clock) with the title,
+channel and thumbnail, and the keyboard's play, pause, next and previous keys
+control it, from any window.
 
 **Picture in picture** (the button beside full screen, or P) moves the video
 into a small window and takes you back to your feed while it keeps playing.
@@ -372,6 +394,7 @@ choose to (see below). Here is every kind of request it makes:
 | A channel's Videos tab | when you open a channel, a page at a time as you scroll, through yt-dlp | youtube.com |
 | Search | when you search, through yt-dlp | youtube.com |
 | A video's details and streams | when you play, through yt-dlp and libmpv | youtube.com, googlevideo.com |
+| A video's captions | only when subtitles are turned on | youtube.com |
 
 The only cookie sent is `SOCS=CAI`, which *declines* YouTube's cookie-consent
 prompt in the EU, unless you turn on a browser's YouTube sign-in
@@ -438,6 +461,7 @@ are for special setups:
 | `GSK_RENDERER` | Matinee uses GTK's OpenGL renderer (`gl`, called `ngl` before GTK 4.18) because video is drawn with OpenGL; set `vulkan` to use GTK's default instead. |
 | `MATINEE_HWDEC_INTEROP=1` | Experimental: zero-copy hardware decoding, which hands decoded frames straight to the GPU. |
 | `MATINEE_PERF=1` | Prints timing to the terminal: start-up stages, a report every 5 seconds of late frames and the slowest work, and what the player is decoding and dropping. Useful when reporting stutter. |
+| `MATINEE_PLAY_FILE` | Plays this local file in place of every video. For trying the player where YouTube can't be reached. |
 | `MATINEE_FEED_BASE`, `MATINEE_THUMB_BASE` | Fetch feeds or thumbnails through a mirror or proxy that copies YouTube's paths. Mainly for testing. |
 
 To make a variable permanent for the launcher entry, edit
@@ -610,7 +634,8 @@ cargo test           # parser and formatting tests
 | `src/card.rs` | the video card and its animation states |
 | `src/thumb.rs` | thumbnail drawing: fade, zoom, dimming, resume bar |
 | `src/smooth.rs` | smooth mouse-wheel scrolling |
-| `src/watch.rs` | the embedded player, its controls and picture in picture |
+| `src/watch.rs` | the embedded player, its controls, chapters, subtitles, autoplay and picture in picture |
+| `src/mpris.rs` | the desktop's media controls and media keys (MPRIS over D-Bus) |
 | `src/ytdlp.rs` | runs yt-dlp for a list of videos and streams its entries as they arrive |
 | `src/history.rs` | a channel's full upload history, a page at a time |
 | `src/perf.rs` | the `MATINEE_PERF=1` timing output |
@@ -663,6 +688,6 @@ a 4K monitor gets 4K, in mpv's separate window too. 4K streams are VP9 or
 AV1, which want hardware decoding for smooth playback.
 
 **Preferences** (main menu, or **Ctrl+,**): dark style, card size, Hide
-Shorts, how often to check for new videos, default quality, resuming, playing
-in a separate window, a browser's YouTube sign-in, smooth scrolling, and the
-channel list.
+Shorts, how often to check for new videos, default quality, resuming,
+autoplay, playing in a separate window, a browser's YouTube sign-in, smooth
+scrolling, and the channel list.

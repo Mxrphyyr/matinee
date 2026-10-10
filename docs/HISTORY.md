@@ -174,3 +174,24 @@ the reasons.
   is known. Lesson: GApplication emits `startup` inside `register`.
 - The owner confirmed the look was back and playback started cleanly, and
   0.4.0 was released. Next: 0.5.0 (player features), then 0.6.0 (browsing).
+
+## 0.5.0: the player
+
+- Media keys and Plasma's media controls through MPRIS, written against
+  gio's D-Bus API rather than a new crate: the window keeps the list a video
+  was played from, so Next and Previous (and autoplay) have somewhere to go.
+- Chapters as marks on the seek bar with the current chapter's name beside
+  the clock; Page Up and Page Down jump. mpv's YouTube hook already sets
+  `chapter-list` from yt-dlp's chapters.
+- A subtitles button. The hook only adds the subtitle tracks yt-dlp was
+  asked for, so Matinee asks for the desktop's language and English,
+  auto-generated included, and selects the best track itself (subtitles
+  start hidden).
+- Autoplay next, off by default, with an "up next" card and eight seconds
+  to say no. In picture in picture it plays on without the card.
+- Tested in the hidden desktop on a local clip (`MATINEE_PLAY_FILE`) with
+  chapters and an SRT track, driving the controls with `gdbus`. A thumbnail
+  already in memory arrived before the card knew which video it was for;
+  fixed by recording the video first.
+- The owner tried all four on the real desktop ("everything works") and
+  0.5.0 was released. Next: 0.6.0 (browsing features).

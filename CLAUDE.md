@@ -66,7 +66,7 @@ features (`gtk` v4_12, `adw` v1_5). It tests, packages
 `matinee-X.Y.Z-x86_64-linux.tar.gz` plus `.sha256`, and when the version in
 Cargo.toml has no release yet, publishes one with the notes in
 `.github/release-notes.md` plus GitHub's generated notes. Published so far:
-v0.3.0, v0.3.1, v0.3.2 and v0.4.0. The owner's gh login has the `workflow` scope needed to
+v0.3.0, v0.3.1, v0.3.2, v0.4.0 and v0.5.0. The owner's gh login has the `workflow` scope needed to
 push workflow changes. A release archive installs with its own `./install.sh`,
 which detects the prebuilt binary and checks libraries before installing.
 
@@ -81,6 +81,7 @@ which detects the prebuilt binary and checks libraries before installing.
 | `smooth.rs` | smooth wheel scrolling (exponential glide that follows the grid's own corrections) |
 | `watch.rs` | embedded player: `Surface` (GLArea plus the one mpv renderer), picture in picture, quality menu, controls, errors |
 | `mpv.rs` | libmpv FFI: client API and OpenGL render API, EGL/GLX proc lookup |
+| `mpris.rs` | the desktop's media controls and media keys: MPRIS on the session bus through gio, no extra crates |
 | `feed.rs` | channel RSS (Atom) feeds: 8 at once on a first load, later 4 at once with pauses; one retry |
 | `ytdlp.rs` | runs yt-dlp for a list and streams its entries as they arrive; optional page gating (reading pauses until `more`) |
 | `history.rs` | a channel's older uploads: `ytdlp` with 60 per page, `--sleep-requests 1` |
@@ -124,6 +125,21 @@ which detects the prebuilt binary and checks libraries before installing.
   on the owner's machine) and the renderer is kept between videos; loading
   starts only after the page's `shown` signal so the slide never waits.
   mpv's compiled shaders are cached in `~/.cache/matinee/shaders`.
+- **Player features (0.5.0).** The window keeps a `queue` (the list the
+  video was played from) for next/previous and autoplay; `Watch` reports
+  `Playback` changes through a hook and the window turns them into
+  `mpris::Now` for the media controls (`org.mpris.MediaPlayer2.matinee`,
+  DesktopEntry = the app id, so Plasma shows the icon). Chapters come from
+  mpv's `chapter-list` (set by ytdl_hook from yt-dlp's chapters) and are
+  `gtk::Scale` marks plus a label; the current one from `chapter`.
+  Subtitles: ytdl_hook only adds tracks yt-dlp was asked for, so
+  `ytdl-raw-options` carries `sub-langs=%n%<lang>.*,en.*` and
+  `write-auto-subs=`; `sid=no` at load, then `select_subtitles` picks the
+  viewer's language. Autoplay shows the "up next" card for 8 s (in PiP it
+  plays on at once). `MATINEE_PLAY_FILE=<file>` plays a local file in place
+  of every video, which is how the hidden desktop tests all this (a clip
+  with chapters and an SRT track made with ffmpeg; MPRIS driven with
+  `gdbus call --dest org.mpris.MediaPlayer2.matinee`).
   The waiting poster is a 32×18 downscale stretched by the GPU (looks
   blurred, costs nothing) and is hidden once video plays. The seek bar and
   clock refresh at most 4 times a second and only while visible. Screen idle

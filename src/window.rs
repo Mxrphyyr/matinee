@@ -8,8 +8,9 @@
 use crate::card::{self, Card, CardOpts};
 use crate::model::{Channel, Video};
 use crate::store::{Store, WindowState};
-use crate::thumbs::Thumbs;
-use crate::watch::{self, Watch, WatchHooks};
+use crate::mpris::{self, Mpris, Now};
+use crate::thumbs::{self, Thumbs};
+use crate::watch::{self, Playback, Watch, WatchHooks};
 use crate::{feed, history, icons, perf, player, resolve, search, smooth, style, tools, trending, util, ytdlp, APP_ID};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
@@ -123,6 +124,11 @@ pub struct Win {
     new_pill: gtk::Revealer,
     new_pill_button: gtk::Button,
     watch: Rc<Watch>,
+    /// The desktop's media controls and media keys.
+    mpris: Rc<Mpris>,
+    /// The list the playing video came from, for playing on through it.
+    queue: RefCell<Vec<Video>>,
+    queue_pos: Cell<usize>,
 
     thumbs: Rc<Thumbs>,
     store: Rc<RefCell<Store>>,
@@ -440,10 +446,11 @@ impl Win {
 
         let volume = store.volume.unwrap_or(100.0);
         let quality = store.quality;
+        let (autoplay, subtitles) = (store.autoplay, store.subtitles);
         let sidebar_filter = Rc::new(SidebarFilter::default());
         sidebar_filter.collapsed.set(store.channels_collapsed);
         let win = Rc::new_cyclic(|weak: &Weak<Self>| {
-            let watch = Watch::new(volume, quality, watch_hooks(weak));
+            let watch = Watch::new(volume, quality, autoplay, subtitles, watch_hooks(weak));
             nav.add(&watch.page);
             Self {
                 window,
@@ -477,6 +484,9 @@ impl Win {
                 new_pill,
                 new_pill_button,
                 watch,
+                mpris: Mpris::start(mpris_hooks(weak)),
+                queue: RefCell::default(),
+                queue_pos: Cell::new(0),
                 thumbs: Thumbs::new(),
                 store: Rc::new(RefCell::new(store)),
                 save_source: Rc::default(),
@@ -779,6 +789,7 @@ impl Win {
         self.action("about", |w| w.about());
         self.action("preferences", |w| w.preferences());
         self.action("sign-in", |w| w.sign_in_dialog());
+        self.action("toggle-subtitles", |w| w.watch.toggle_subtitles());
         self.action("toggle-sidebar", |w| w.split.set_show_sidebar(!w.split.shows_sidebar()));
         self.action("focus-search", |w| {
             w.after_navigation();
@@ -2177,8 +2188,74 @@ impl Win {
             .or_else(|| find(&self.store.borrow().feed))
     }
 
+    /// Plays a video from the list on screen, which becomes the list to play
+    /// on through (autoplay, the media controls' next and previous).
     fn play(self: &Rc<Self>, id: &str) {
         let Some(video) = self.find_video(id) else { return };
+        let list = self.shown.borrow().clone();
+        match list.iter().position(|v| v.id == id) {
+            Some(position) => {
+                *self.queue.borrow_mut() = list;
+                self.queue_pos.set(position);
+            }
+            None => {
+                *self.queue.borrow_mut() = vec![video.clone()];
+                self.queue_pos.set(0);
+            }
+        }
+        self.play_video(&video);
+    }
+
+    fn next_video(&self) -> Option<Video> {
+        self.queue.borrow().get(self.queue_pos.get() + 1).cloned()
+    }
+
+    fn play_next(self: &Rc<Self>) {
+        if let Some(video) = self.next_video() {
+            self.queue_pos.set(self.queue_pos.get() + 1);
+            self.play_video(&video);
+        }
+    }
+
+    /// Back to the start of this video, or, from its first seconds, to the
+    /// one before it.
+    fn play_previous(self: &Rc<Self>) {
+        let position = self.queue_pos.get();
+        if self.watch.position() > 5.0 || position == 0 {
+            self.watch.seek_to(0.0);
+            return;
+        }
+        let previous = self.queue.borrow().get(position - 1).cloned();
+        if let Some(video) = previous {
+            self.queue_pos.set(position - 1);
+            self.play_video(&video);
+        }
+    }
+
+    /// What the media controls show, from how the player says playback is going.
+    fn playback_changed(&self, video: Option<&Video>, playback: Playback) {
+        let now = match video {
+            Some(video) => Now {
+                status: playback.status,
+                id: video.id.clone(),
+                title: video.title.clone(),
+                channel: video.channel_name.clone(),
+                url: video.watch_url(),
+                art: Some(thumbs::cached_path(&video.id)),
+                length: playback.duration,
+                volume: playback.volume / 100.0,
+                rate: playback.speed,
+                can_go_next: self.next_video().is_some(),
+                can_go_previous: true,
+            },
+            None => Now::default(),
+        };
+        self.mpris.update(now);
+    }
+
+    fn play_video(self: &Rc<Self>, video: &Video) {
+        let id = video.id.as_str();
+        let video = video.clone();
         if self.store.borrow().external_player {
             self.play_external(&video, None);
             return;
@@ -2352,6 +2429,11 @@ impl Win {
         let quality_row = combo_row("Video quality", &quality_labels, quality_index);
         quality_row.set_subtitle("Where a video starts; change it for one video from the player");
         let resume_row = switch_row("Resume where I left off", "", resume);
+        let autoplay_row = switch_row(
+            "Autoplay the next video",
+            "When a video ends, play the next one in the list, with a few seconds to say no",
+            self.store.borrow().autoplay,
+        );
         let external_row = switch_row("Play in a separate window", "Open videos in mpv's own window", external);
         let sign_in = self.store.borrow().cookies_browser.clone();
         let choices = self.sign_in_choices();
@@ -2364,6 +2446,7 @@ impl Win {
         );
         playback.add(&quality_row);
         playback.add(&resume_row);
+        playback.add(&autoplay_row);
         playback.add(&external_row);
         playback.add(&sign_in_row);
 
@@ -2400,6 +2483,12 @@ impl Win {
         resume_row.connect_active_notify(move |row| {
             this.store.borrow_mut().no_resume = !row.is_active();
             this.save_later();
+        });
+        let this = self.clone();
+        autoplay_row.connect_active_notify(move |row| {
+            this.store.borrow_mut().autoplay = row.is_active();
+            this.save_later();
+            this.watch.set_autoplay(row.is_active());
         });
         let this = self.clone();
         external_row.connect_active_notify(move |row| this.set_toggle("external-player", row.is_active()));
@@ -2580,6 +2669,94 @@ fn watch_hooks(weak: &Weak<Win>) -> WatchHooks {
                 win.sign_in_dialog();
             }
         }),
+        playback: Box::new({
+            let weak = weak.clone();
+            move |video: Option<&Video>, playback: Playback| {
+                if let Some(win) = weak.upgrade() {
+                    win.playback_changed(video, playback);
+                }
+            }
+        }),
+        seeked: Box::new({
+            let weak = weak.clone();
+            move |seconds: f64| {
+                if let Some(win) = weak.upgrade() {
+                    win.mpris.seeked(seconds);
+                }
+            }
+        }),
+        next_video: Box::new({
+            let weak = weak.clone();
+            move || weak.upgrade().and_then(|win| win.next_video())
+        }),
+        play_next: Box::new({
+            let weak = weak.clone();
+            move || {
+                if let Some(win) = weak.upgrade() {
+                    win.play_next();
+                }
+            }
+        }),
+        play_previous: Box::new({
+            let weak = weak.clone();
+            move || {
+                if let Some(win) = weak.upgrade() {
+                    win.play_previous();
+                }
+            }
+        }),
+        thumbnail: Box::new({
+            let weak = weak.clone();
+            move |id: &str, done: Box<dyn FnOnce(&gdk::Texture)>| {
+                if let Some(win) = weak.upgrade() {
+                    win.thumbs.get(id, done);
+                }
+            }
+        }),
+        subtitles_changed: Box::new({
+            let weak = weak.clone();
+            move |on: bool| {
+                if let Some(win) = weak.upgrade() {
+                    win.store.borrow_mut().subtitles = on;
+                    win.save_later();
+                }
+            }
+        }),
+    }
+}
+
+/// What the desktop's media controls (and media keys) can ask of Matinee.
+fn mpris_hooks(weak: &Weak<Win>) -> mpris::Hooks {
+    let with = |f: fn(&Rc<Win>)| {
+        let weak = weak.clone();
+        Box::new(move || {
+            if let Some(win) = weak.upgrade() {
+                f(&win);
+            }
+        }) as Box<dyn Fn()>
+    };
+    let seconds = |f: fn(&Rc<Win>, f64)| {
+        let weak = weak.clone();
+        Box::new(move |value: f64| {
+            if let Some(win) = weak.upgrade() {
+                f(&win, value);
+            }
+        }) as Box<dyn Fn(f64)>
+    };
+    let position = weak.clone();
+    mpris::Hooks {
+        play_pause: with(|win| win.watch.play_pause()),
+        play: with(|win| win.watch.play()),
+        pause: with(|win| win.watch.pause()),
+        stop: with(|win| win.watch.close()),
+        next: with(|win| win.play_next()),
+        previous: with(|win| win.play_previous()),
+        seek_by: seconds(|win, delta| win.watch.seek_by(delta)),
+        seek_to: seconds(|win, at| win.watch.seek_to(at)),
+        set_volume: seconds(|win, volume| win.watch.set_volume(volume * 100.0)),
+        position: Box::new(move || position.upgrade().map_or(0.0, |win| win.watch.position())),
+        raise: with(|win| win.window.present()),
+        quit: with(|win| win.window.close()),
     }
 }
 

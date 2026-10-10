@@ -43,6 +43,11 @@ pub struct Thumbs {
     next_token: Cell<u64>,
 }
 
+/// Where a video's thumbnail sits on disk once fetched.
+pub fn cached_path(video_id: &str) -> std::path::PathBuf {
+    glib::user_cache_dir().join("matinee").join("thumbs").join(format!("{video_id}.jpg"))
+}
+
 impl Thumbs {
     pub fn new() -> Rc<Self> {
         let dir = glib::user_cache_dir().join("matinee").join("thumbs");

@@ -59,6 +59,12 @@ pub struct Store {
     /// When the feed was last checked for new uploads, in Unix seconds.
     #[serde(default)]
     pub last_refresh: Option<i64>,
+    /// After a video ends, play the next one in the list it came from.
+    #[serde(default)]
+    pub autoplay: bool,
+    /// Show subtitles when a video has them.
+    #[serde(default)]
+    pub subtitles: bool,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]

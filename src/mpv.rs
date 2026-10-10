@@ -158,6 +158,8 @@ pub enum Value {
 }
 
 pub enum Format {
+    /// Just the fact that it changed; read the value afterwards.
+    None,
     Flag,
     Double,
 }
@@ -273,6 +275,7 @@ impl Mpv {
     pub fn observe(&self, name: &str, format: Format) {
         let name = cstring(name);
         let format = match format {
+            Format::None => 0,
             Format::Flag => FORMAT_FLAG,
             Format::Double => FORMAT_DOUBLE,
         };

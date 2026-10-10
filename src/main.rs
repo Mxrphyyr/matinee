@@ -5,6 +5,7 @@ mod feed;
 mod history;
 mod icons;
 mod model;
+mod mpris;
 mod mpv;
 mod net;
 mod perf;

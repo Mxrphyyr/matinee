@@ -84,6 +84,10 @@ const BUILTIN: &[(&str, &str)] = &[
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><g fill="#2e3436"><path fill-rule="evenodd" d="M2.5 2h11A1.5 1.5 0 0 1 15 3.5v9a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9A1.5 1.5 0 0 1 2.5 2zm4 1.5v9h7v-9z"/></g></svg>"##,
     ),
     (
+        "media-view-subtitles-symbolic",
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><g fill="#2e3436"><path fill-rule="evenodd" d="M2.5 3h11A1.5 1.5 0 0 1 15 4.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 11.5v-7A1.5 1.5 0 0 1 2.5 3zm0 1.5v7h11v-7z"/><path d="M3.5 6.2h5v1.4h-5zM9.7 6.2h2.8v1.4H9.7zM3.5 8.6h2.8V10H3.5zM7.5 8.6h5V10h-5z"/></g></svg>"##,
+    ),
+    (
         "trending-symbolic",
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><g fill="#2e3436"><rect x="1.5" y="9" width="3.4" height="5.5" rx=".9"/><rect x="6.3" y="5.5" width="3.4" height="9" rx=".9"/><rect x="11.1" y="1.5" width="3.4" height="13" rx=".9"/></g></svg>"##,
     ),

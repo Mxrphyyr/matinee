@@ -214,15 +214,45 @@ pub fn sign_in_args() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The same, in the form mpv's `ytdl-raw-options` expects.
-pub fn mpv_sign_in() -> String {
-    sign_in().map(|browser| mpv_cookies_option(&browser.source)).unwrap_or_default()
+/// mpv's `ytdl-raw-options`: the browser sign-in, when it's on, and the
+/// subtitles yt-dlp should list: the viewer's language and English, the
+/// auto-generated ones included. (mpv's YouTube hook only adds the subtitle
+/// tracks yt-dlp was asked for.)
+pub fn mpv_ytdl_options() -> String {
+    let mut options = Vec::new();
+    if let Some(browser) = sign_in() {
+        options.push(mpv_cookies_option(&browser.source));
+    }
+    let language = preferred_language();
+    let mut languages = vec![format!("{language}.*")];
+    if language != "en" {
+        languages.push("en.*".to_string());
+    }
+    options.push(format!("sub-langs={}", mpv_quoted(&languages.join(","))));
+    options.push("write-auto-subs=".to_string());
+    options.join(",")
 }
 
-/// The value is quoted with its length (`%n%`), so nothing in a folder's
-/// name can be misread as the start of another option.
+/// The language subtitles should be in: the desktop's, or English.
+pub fn preferred_language() -> String {
+    for name in ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"] {
+        let Ok(value) = std::env::var(name) else { continue };
+        let code: String = value.chars().take_while(char::is_ascii_alphabetic).collect::<String>().to_lowercase();
+        if code.len() >= 2 && code != "posix" {
+            return code;
+        }
+    }
+    "en".to_string()
+}
+
 fn mpv_cookies_option(source: &str) -> String {
-    format!("cookies-from-browser=%{}%{source}", source.len())
+    format!("cookies-from-browser={}", mpv_quoted(source))
+}
+
+/// A value in mpv's key-value lists, quoted with its length (`%n%`) so
+/// commas, or anything in a folder's name, can't be misread as the next key.
+fn mpv_quoted(value: &str) -> String {
+    format!("%{}%{value}", value.len())
 }
 
 #[cfg(test)]
@@ -273,6 +303,7 @@ mod tests {
     fn quotes_folders_for_mpv() {
         assert_eq!(mpv_cookies_option("firefox"), "cookies-from-browser=%7%firefox");
         assert_eq!(mpv_cookies_option("chrome:/a,b"), "cookies-from-browser=%11%chrome:/a,b");
+        assert_eq!(mpv_quoted("en.*,de.*"), "%9%en.*,de.*");
     }
 
     #[test]

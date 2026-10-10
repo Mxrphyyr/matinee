@@ -43,11 +43,9 @@ pub fn spawn(video: &Video, start: Option<f64>, height: u32) -> Result<Child, St
             if let Some(path) = tools::find_yt_dlp() {
                 cmd.arg(format!("--script-opts=ytdl_hook-ytdl_path={}", path.display()));
             }
-            // The browser sign-in, if it's turned on in Preferences.
-            let sign_in = tools::mpv_sign_in();
-            if !sign_in.is_empty() {
-                cmd.arg(format!("--ytdl-raw-options={sign_in}"));
-            }
+            // The browser sign-in, if it's turned on in Preferences, and the
+            // subtitles to list.
+            cmd.arg(format!("--ytdl-raw-options={}", tools::mpv_ytdl_options()));
             // mpv writes its messages here; `wait` reads them.
             cmd.stdout(Stdio::piped());
             cmd

@@ -465,6 +465,50 @@ statuspage.floaty image.icon {
   color: alpha(white, 0.85);
   font-feature-settings: "tnum";
 }
+/* The current chapter's name, after the clock. */
+.watch-chapter {
+  margin-left: 10px;
+  color: alpha(white, 0.62);
+  font-size: 0.92em;
+}
+/* Chapter starts, as small ticks under the seek bar. */
+.watch-seek marks {
+  color: alpha(white, 0.55);
+}
+.watch-seek mark indicator {
+  min-height: 5px;
+  min-width: 2px;
+  background-color: alpha(white, 0.55);
+  border-radius: 1px;
+}
+.watch-controls button.subtitles.active {
+  color: @mt_gold;
+}
+/* The "up next" card: the next video, with a few seconds to say no. */
+.up-next {
+  padding: 14px 18px 14px 14px;
+  border-radius: 16px;
+  background-color: alpha(@mt_velvet, 0.92);
+  color: white;
+}
+.up-next-heading {
+  color: @mt_gold;
+  font-size: 0.82em;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+.up-next-title {
+  font-weight: 700;
+}
+.up-next-channel {
+  color: alpha(white, 0.72);
+  font-size: 0.92em;
+}
+.up-next-count {
+  color: alpha(white, 0.6);
+  font-size: 0.9em;
+  font-feature-settings: "tnum";
+}
 
 .watch .speed {
   min-width: 44px;

@@ -9,6 +9,7 @@
 
 use crate::icons;
 use crate::model::Video;
+use crate::mpris::Status;
 use crate::mpv::{self, Event, Format, Mpv, Render, Value};
 use crate::{perf, tools, util};
 use adw::prelude::*;
@@ -22,6 +23,8 @@ const HIDE_PIP_CONTROLS_AFTER: Duration = Duration::from_millis(1600);
 const SPEEDS: [f64; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
 /// The seek bar and clock refresh at most this often, and only while shown.
 const PROGRESS_INTERVAL_US: i64 = 250_000;
+/// How long the "up next" card waits before playing on.
+const AUTOPLAY_SECONDS: u32 = 8;
 
 pub struct WatchHooks {
     /// The first frame is on screen.
@@ -35,6 +38,29 @@ pub struct WatchHooks {
     pub quality_changed: Box<dyn Fn(Option<u32>)>,
     /// The viewer wants to choose a browser whose YouTube sign-in to use.
     pub choose_sign_in: Box<dyn Fn()>,
+    /// Playback changed: what's playing (None once stopped) and how.
+    pub playback: Box<dyn Fn(Option<&Video>, Playback)>,
+    /// The position jumped to this second.
+    pub seeked: Box<dyn Fn(f64)>,
+    /// The video after this one in the list it was opened from.
+    pub next_video: Box<dyn Fn() -> Option<Video>>,
+    pub play_next: Box<dyn Fn()>,
+    pub play_previous: Box<dyn Fn()>,
+    /// Fetches a video's thumbnail, for the "up next" card.
+    pub thumbnail: Box<dyn Fn(&str, Box<dyn FnOnce(&gdk::Texture)>)>,
+    /// Subtitles were turned on or off in the player; remember it.
+    pub subtitles_changed: Box<dyn Fn(bool)>,
+}
+
+/// How playback is going, for the desktop's media controls.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Playback {
+    pub status: Status,
+    /// Seconds; 0 while unknown.
+    pub duration: f64,
+    pub speed: f64,
+    /// 0 to 100.
+    pub volume: f64,
 }
 
 /// A place mpv can draw: the player page or the picture-in-picture window.
@@ -126,14 +152,23 @@ pub struct Watch {
     channel: gtk::Label,
     seek: gtk::Scale,
     time: gtk::Label,
+    /// The current chapter's name, beside the clock.
+    chapter: gtk::Label,
     play: gtk::Button,
     mute: gtk::Button,
     volume: gtk::Scale,
     speed: gtk::Button,
+    subtitles_button: gtk::Button,
     quality_button: gtk::MenuButton,
     pip_button: gtk::Button,
     fullscreen: gtk::Button,
     start_over: gtk::Button,
+    /// The "up next" card shown when a video ends with autoplay on.
+    up_next: gtk::Box,
+    up_next_thumb: gtk::Picture,
+    up_next_title: gtk::Label,
+    up_next_channel: gtk::Label,
+    up_next_count: gtk::Label,
 
     hooks: WatchHooks,
     initial_volume: f64,
@@ -173,10 +208,20 @@ pub struct Watch {
     resume_at: Cell<f64>,
     /// Keeps the screen awake while a video plays.
     inhibit_cookie: Cell<u32>,
+    /// A video is open (loading, playing, paused or ended), as opposed to stopped.
+    open: Cell<bool>,
+    /// The video's chapters: start time and title.
+    chapters: RefCell<Vec<(f64, String)>>,
+    subtitles: Cell<bool>,
+    autoplay: Cell<bool>,
+    /// The video the "up next" card offers, while its countdown runs.
+    up_next_video: RefCell<Option<Video>>,
+    countdown_source: RefCell<Option<glib::SourceId>>,
+    countdown_left: Cell<u32>,
 }
 
 impl Watch {
-    pub fn new(initial_volume: f64, quality: Option<u32>, hooks: WatchHooks) -> Rc<Self> {
+    pub fn new(initial_volume: f64, quality: Option<u32>, autoplay: bool, subtitles: bool, hooks: WatchHooks) -> Rc<Self> {
         let main = Surface::new("video");
         // Hidden until the page has slid in, so the slide never waits on OpenGL.
         main.area.set_visible(false);
@@ -271,6 +316,12 @@ impl Watch {
         let play = icon_button("media-playback-pause-symbolic", "Pause (Space)");
         let time = gtk::Label::new(Some("0:00"));
         time.add_css_class("watch-time");
+        let chapter = gtk::Label::new(None);
+        chapter.add_css_class("watch-chapter");
+        chapter.set_ellipsize(pango::EllipsizeMode::End);
+        chapter.set_max_width_chars(40);
+        chapter.set_valign(gtk::Align::Center);
+        chapter.set_visible(false);
         let start_over = gtk::Button::with_label("Start over");
         start_over.add_css_class("start-over");
         start_over.set_valign(gtk::Align::Center);
@@ -289,6 +340,11 @@ impl Watch {
         speed.add_css_class("speed");
         speed.set_valign(gtk::Align::Center);
         speed.set_tooltip_text(Some("Playback speed"));
+        let subtitles_button = icon_button("media-view-subtitles-symbolic", "Subtitles (C)");
+        subtitles_button.add_css_class("subtitles");
+        if subtitles {
+            subtitles_button.add_css_class("active");
+        }
         let quality_menu = gio::Menu::new();
         for (key, label) in QUALITY_CHOICES {
             let item = gio::MenuItem::new(Some(label), None);
@@ -310,11 +366,13 @@ impl Watch {
         for widget in [
             play.upcast_ref::<gtk::Widget>(),
             time.upcast_ref(),
+            chapter.upcast_ref(),
             start_over.upcast_ref(),
             spacer.upcast_ref(),
             mute.upcast_ref(),
             volume.upcast_ref(),
             speed.upcast_ref(),
+            subtitles_button.upcast_ref(),
             quality_button.upcast_ref(),
             pip_button.upcast_ref(),
             fullscreen.upcast_ref(),
@@ -333,6 +391,55 @@ impl Watch {
             .child(&controls)
             .build();
 
+        // ── Up next ──
+        let up_next_thumb = gtk::Picture::new();
+        up_next_thumb.set_size_request(160, 90);
+        up_next_thumb.set_content_fit(gtk::ContentFit::Cover);
+        up_next_thumb.set_can_shrink(true);
+        up_next_thumb.add_css_class("up-next-thumb");
+        let up_next_heading = gtk::Label::new(Some("Up next"));
+        up_next_heading.add_css_class("up-next-heading");
+        up_next_heading.set_xalign(0.0);
+        let up_next_title = gtk::Label::new(None);
+        up_next_title.add_css_class("up-next-title");
+        up_next_title.set_xalign(0.0);
+        up_next_title.set_wrap(true);
+        up_next_title.set_lines(2);
+        up_next_title.set_ellipsize(pango::EllipsizeMode::End);
+        up_next_title.set_max_width_chars(30);
+        let up_next_channel = gtk::Label::new(None);
+        up_next_channel.add_css_class("up-next-channel");
+        up_next_channel.set_xalign(0.0);
+        up_next_channel.set_ellipsize(pango::EllipsizeMode::End);
+        let up_next_count = gtk::Label::new(None);
+        up_next_count.add_css_class("up-next-count");
+        up_next_count.set_xalign(0.0);
+        let play_now = gtk::Button::with_label("Play now");
+        play_now.add_css_class("pill");
+        play_now.add_css_class("suggested-action");
+        let cancel_next = gtk::Button::with_label("Cancel");
+        cancel_next.add_css_class("pill");
+        let up_next_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        up_next_buttons.set_margin_top(6);
+        up_next_buttons.append(&play_now);
+        up_next_buttons.append(&cancel_next);
+        let up_next_text = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        up_next_text.set_valign(gtk::Align::Center);
+        up_next_text.append(&up_next_heading);
+        up_next_text.append(&up_next_title);
+        up_next_text.append(&up_next_channel);
+        up_next_text.append(&up_next_count);
+        up_next_text.append(&up_next_buttons);
+        let up_next = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+        up_next.add_css_class("up-next");
+        up_next.set_halign(gtk::Align::End);
+        up_next.set_valign(gtk::Align::End);
+        up_next.set_margin_end(24);
+        up_next.set_margin_bottom(100);
+        up_next.set_visible(false);
+        up_next.append(&up_next_thumb);
+        up_next.append(&up_next_text);
+
         let stage = gtk::Overlay::new();
         stage.add_css_class("watch");
         stage.set_focusable(true);
@@ -340,6 +447,7 @@ impl Watch {
         stage.add_overlay(&poster);
         stage.add_overlay(&spinner);
         stage.add_overlay(&problem);
+        stage.add_overlay(&up_next);
         stage.add_overlay(&top);
         stage.add_overlay(&bottom);
 
@@ -371,14 +479,21 @@ impl Watch {
             channel,
             seek,
             time,
+            chapter,
             play,
             mute,
             volume,
             speed,
+            subtitles_button,
             quality_button,
             pip_button,
             fullscreen,
             start_over,
+            up_next,
+            up_next_thumb,
+            up_next_title,
+            up_next_channel,
+            up_next_count,
             hooks,
             initial_volume,
             quality: Cell::new(quality),
@@ -410,12 +525,27 @@ impl Watch {
             load_generation: Cell::new(0),
             resume_at: Cell::new(0.0),
             inhibit_cookie: Cell::new(0),
+            open: Cell::new(false),
+            chapters: RefCell::default(),
+            subtitles: Cell::new(subtitles),
+            autoplay: Cell::new(autoplay),
+            up_next_video: RefCell::default(),
+            countdown_source: RefCell::default(),
+            countdown_left: Cell::new(0),
         });
-        watch.connect(&retry, &pop_out, &top_bar, &controls);
+        watch.connect(&retry, &pop_out, &play_now, &cancel_next, &top_bar, &controls);
         watch
     }
 
-    fn connect(self: &Rc<Self>, retry: &gtk::Button, pop_out: &gtk::Button, top_bar: &gtk::Box, controls: &gtk::Box) {
+    fn connect(
+        self: &Rc<Self>,
+        retry: &gtk::Button,
+        pop_out: &gtk::Button,
+        play_now: &gtk::Button,
+        cancel_next: &gtk::Button,
+        top_bar: &gtk::Box,
+        controls: &gtk::Box,
+    ) {
         // ── Buttons ──
         let on = |button: &gtk::Button, action: fn(&Rc<Watch>)| {
             let weak = Rc::downgrade(self);
@@ -443,6 +573,9 @@ impl Watch {
         on(&self.elsewhere, |w| w.pop_out());
         on(&self.choose_browser, |w| (w.hooks.choose_sign_in)());
         on(pop_out, |w| w.pop_out());
+        on(&self.subtitles_button, |w| w.toggle_subtitles());
+        on(play_now, |w| w.play_next_now());
+        on(cancel_next, |w| w.cancel_autoplay());
 
         let weak = Rc::downgrade(self);
         self.seek.connect_change_value(move |_, _, value| {
@@ -563,6 +696,26 @@ impl Watch {
                     watch.toggle_mute();
                     true
                 }
+                gdk::Key::c | gdk::Key::C => {
+                    watch.toggle_subtitles();
+                    true
+                }
+                gdk::Key::n => {
+                    watch.play_next_now();
+                    true
+                }
+                gdk::Key::N => {
+                    (watch.hooks.play_previous)();
+                    true
+                }
+                gdk::Key::Page_Down => {
+                    watch.step_chapter(1);
+                    true
+                }
+                gdk::Key::Page_Up => {
+                    watch.step_chapter(-1);
+                    true
+                }
                 gdk::Key::Home => {
                     watch.seek_to(0.0);
                     true
@@ -632,6 +785,11 @@ impl Watch {
         self.load_generation.set(self.load_generation.get() + 1);
         self.resume_at.set(resume.unwrap_or(0.0));
         self.start_over.set_visible(false);
+        self.cancel_autoplay();
+        self.chapters.borrow_mut().clear();
+        self.seek.clear_marks();
+        self.chapter.set_visible(false);
+        self.open.set(true);
         *self.video.borrow_mut() = Some(video.clone());
         self.page.set_title(&video.title);
         self.title.set_label(&video.title);
@@ -659,6 +817,7 @@ impl Watch {
             self.begin();
         }
         self.stage.grab_focus();
+        self.notify_playback();
     }
 
     /// Shows a soft, dimmed version of the thumbnail while the stream loads.
@@ -707,6 +866,8 @@ impl Watch {
                 (self.hooks.stopped)(&video, self.position.get(), self.duration.get());
             }
         }
+        self.open.set(false);
+        self.cancel_autoplay();
         self.pending.borrow_mut().take();
         if let Some(mpv) = self.mpv() {
             let _ = mpv.command(&["stop"]);
@@ -716,6 +877,7 @@ impl Watch {
                 source.remove();
             }
         }
+        self.notify_playback();
         self.set_fullscreen(false);
         self.set_inhibit(false);
         self.stage.set_cursor(None);
@@ -791,6 +953,8 @@ impl Watch {
                     ("mute", Format::Flag),
                     ("speed", Format::Double),
                     ("height", Format::Double),
+                    ("chapter-list", Format::None),
+                    ("chapter", Format::None),
                 ] {
                     mpv.observe(name, format);
                 }
@@ -931,11 +1095,17 @@ impl Watch {
         mpv.set_flag("pause", false);
         mpv.set_double("speed", SPEEDS[self.speed_index.get()]);
         mpv.set_string("ytdl-format", &self.format());
-        // The browser sign-in, if it's turned on in Preferences.
-        mpv.set_string("ytdl-raw-options", &tools::mpv_sign_in());
+        // The browser sign-in, if it's turned on in Preferences, and which
+        // subtitles yt-dlp should list.
+        mpv.set_string("ytdl-raw-options", &tools::mpv_ytdl_options());
+        // Subtitles start hidden; the button (or the remembered choice) shows them.
+        mpv.set_string("sid", "no");
         // Applies to this file only; reset once it has loaded.
         let start = self.resume_at.get();
         mpv.set_string("start", &if start > 0.0 { format!("{start:.1}") } else { "none".to_string() });
+        // MATINEE_PLAY_FILE plays a local file in place of every video: for
+        // trying the player where YouTube can't be reached.
+        let url = std::env::var("MATINEE_PLAY_FILE").ok().filter(|f| !f.is_empty()).unwrap_or(url);
         if let Err(e) = mpv.command(&["loadfile", &url, "replace"]) {
             self.show_problem("This video won't play", &e);
         }
@@ -954,6 +1124,10 @@ impl Watch {
                         self.resume_at.set(0.0);
                         mpv.command_async(&["seek", "0", "absolute"]);
                     }
+                    if self.subtitles.get() {
+                        self.select_subtitles(&mpv);
+                    }
+                    self.read_chapters(&mpv);
                 }
                 Event::EndFile { failed: true, code } => {
                     // mpv delivers log lines after other events; give yt-dlp's
@@ -1010,6 +1184,8 @@ impl Watch {
                 self.duration.set(seconds);
                 self.seek.set_range(0.0, seconds.max(0.1));
                 self.refresh_progress(true);
+                self.apply_chapter_marks();
+                self.notify_playback();
             }
             ("demuxer-cache-time", Value::Double(seconds)) => self.cache_time.set(seconds),
             ("pause", Value::Flag(paused)) => {
@@ -1017,6 +1193,7 @@ impl Watch {
                 self.update_play_button();
                 self.set_inhibit(!paused && self.started.get());
                 self.show_controls();
+                self.notify_playback();
             }
             ("eof-reached", Value::Flag(ended)) => {
                 self.ended.set(ended);
@@ -1025,7 +1202,17 @@ impl Watch {
                     self.set_inhibit(false);
                 }
                 self.show_controls();
+                self.notify_playback();
+                if ended && self.started.get() {
+                    self.on_ended();
+                }
             }
+            ("chapter-list", _) => {
+                if let Some(mpv) = self.mpv() {
+                    self.read_chapters(&mpv);
+                }
+            }
+            ("chapter", _) => self.update_chapter_label(),
             ("paused-for-cache", Value::Flag(waiting)) => {
                 if self.started.get() {
                     self.set_busy(waiting);
@@ -1035,12 +1222,16 @@ impl Watch {
                 self.volume.set_value(volume);
                 self.update_mute_button();
                 (self.hooks.volume_changed)(volume);
+                self.notify_playback();
             }
             ("mute", Value::Flag(muted)) => {
                 self.muted.set(muted);
                 self.update_mute_button();
             }
-            ("speed", Value::Double(speed)) => self.speed.set_label(&speed_label(speed)),
+            ("speed", Value::Double(speed)) => {
+                self.speed.set_label(&speed_label(speed));
+                self.notify_playback();
+            }
             ("height", Value::Double(height)) => self.quality_button.set_label(&height_label(height)),
             _ => {}
         }
@@ -1338,11 +1529,249 @@ impl Watch {
         }
     }
 
+    // ── For the desktop's media controls ───────────────────────────────
+
+    pub fn play_pause(&self) {
+        self.toggle_pause();
+    }
+
+    pub fn play(&self) {
+        if self.ended.get() {
+            self.toggle_pause();
+        } else if let Some(mpv) = self.mpv() {
+            mpv.set_flag("pause", false);
+        }
+    }
+
+    pub fn pause(&self) {
+        if let Some(mpv) = self.mpv() {
+            mpv.set_flag("pause", true);
+        }
+    }
+
+    /// Stops and leaves the player, whichever form it's in.
+    pub fn close(self: &Rc<Self>) {
+        if self.in_pip() {
+            self.leave_pip(false);
+        } else if self.shown.get() {
+            let _ = self.page.activate_action("navigation.pop", None);
+        }
+    }
+
+    pub fn position(&self) -> f64 {
+        self.position.get()
+    }
+
+    pub fn set_autoplay(&self, on: bool) {
+        self.autoplay.set(on);
+        if !on {
+            self.cancel_autoplay();
+        }
+    }
+
+    fn status(&self) -> Status {
+        if !self.open.get() {
+            Status::Stopped
+        } else if self.paused.get() || self.ended.get() {
+            Status::Paused
+        } else {
+            Status::Playing
+        }
+    }
+
+    /// Tells the window (and through it the media controls) how playback
+    /// is going.
+    fn notify_playback(&self) {
+        let video = self.video.borrow().clone();
+        let playback = Playback {
+            status: self.status(),
+            duration: self.duration.get(),
+            speed: SPEEDS[self.speed_index.get()],
+            volume: self.volume.value(),
+        };
+        (self.hooks.playback)(video.as_ref().filter(|_| self.open.get()), playback);
+    }
+
+    // ── Up next ────────────────────────────────────────────────────────
+
+    /// The video ended: with autoplay on, offer the next one, with a few
+    /// seconds to say no. In picture in picture it simply plays on.
+    fn on_ended(self: &Rc<Self>) {
+        if !self.autoplay.get() {
+            return;
+        }
+        let Some(next) = (self.hooks.next_video)() else { return };
+        if self.in_pip() {
+            (self.hooks.play_next)();
+            return;
+        }
+        self.up_next_title.set_label(&next.title);
+        self.up_next_channel.set_label(&next.channel_name);
+        self.up_next_thumb.set_paintable(None::<&gdk::Paintable>);
+        let id = next.id.clone();
+        // Noted before the thumbnail is asked for: one already in memory
+        // arrives at once.
+        *self.up_next_video.borrow_mut() = Some(next);
+        let weak = Rc::downgrade(self);
+        (self.hooks.thumbnail)(
+            &id.clone(),
+            Box::new(move |texture| {
+                if let Some(watch) = weak.upgrade() {
+                    if watch.up_next_video.borrow().as_ref().is_some_and(|v| v.id == id) {
+                        watch.up_next_thumb.set_paintable(Some(texture));
+                    }
+                }
+            }),
+        );
+        self.countdown_left.set(AUTOPLAY_SECONDS);
+        self.show_countdown();
+        self.up_next.set_visible(true);
+        if let Some(source) = self.countdown_source.borrow_mut().take() {
+            source.remove();
+        }
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_seconds_local(1, move || {
+            let Some(watch) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let left = watch.countdown_left.get().saturating_sub(1);
+            watch.countdown_left.set(left);
+            if left == 0 {
+                watch.countdown_source.borrow_mut().take();
+                watch.play_next_now();
+                return glib::ControlFlow::Break;
+            }
+            watch.show_countdown();
+            glib::ControlFlow::Continue
+        });
+        *self.countdown_source.borrow_mut() = Some(source);
+    }
+
+    fn show_countdown(&self) {
+        self.up_next_count.set_label(&format!("Playing in {} s", self.countdown_left.get()));
+    }
+
+    fn cancel_autoplay(&self) {
+        if let Some(source) = self.countdown_source.borrow_mut().take() {
+            source.remove();
+        }
+        self.up_next_video.borrow_mut().take();
+        self.up_next.set_visible(false);
+    }
+
+    fn play_next_now(self: &Rc<Self>) {
+        self.cancel_autoplay();
+        (self.hooks.play_next)();
+    }
+
+    // ── Chapters ───────────────────────────────────────────────────────
+
+    fn read_chapters(&self, mpv: &Mpv) {
+        let count = mpv.string("chapter-list/count").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(500);
+        let chapters: Vec<(f64, String)> = (0..count)
+            .map(|i| {
+                let time = mpv.double(&format!("chapter-list/{i}/time")).unwrap_or(0.0);
+                let title = mpv.string(&format!("chapter-list/{i}/title")).unwrap_or_default();
+                (time, title)
+            })
+            .collect();
+        *self.chapters.borrow_mut() = chapters;
+        self.apply_chapter_marks();
+        self.update_chapter_label();
+    }
+
+    /// Marks each chapter's start on the seek bar.
+    fn apply_chapter_marks(&self) {
+        self.seek.clear_marks();
+        let duration = self.duration.get();
+        if duration <= 0.0 {
+            return;
+        }
+        for (time, _) in self.chapters.borrow().iter() {
+            if *time > 0.5 && *time < duration {
+                self.seek.add_mark(*time, gtk::PositionType::Bottom, None);
+            }
+        }
+    }
+
+    fn update_chapter_label(&self) {
+        let title = self
+            .mpv()
+            .and_then(|mpv| mpv.string("chapter"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|index| self.chapters.borrow().get(index).map(|(_, title)| title.clone()))
+            .filter(|title| !title.is_empty());
+        match title {
+            Some(title) => {
+                self.chapter.set_label(&title);
+                self.chapter.set_visible(true);
+            }
+            None => self.chapter.set_visible(false),
+        }
+    }
+
+    /// To the next (1) or previous (-1) chapter.
+    fn step_chapter(&self, step: i32) {
+        if self.chapters.borrow().is_empty() {
+            return;
+        }
+        if let Some(mpv) = self.mpv() {
+            mpv.command_async(&["add", "chapter", &step.to_string()]);
+        }
+    }
+
+    // ── Subtitles ──────────────────────────────────────────────────────
+
+    pub fn toggle_subtitles(&self) {
+        let on = !self.subtitles.get();
+        self.subtitles.set(on);
+        if on {
+            self.subtitles_button.add_css_class("active");
+        } else {
+            self.subtitles_button.remove_css_class("active");
+        }
+        (self.hooks.subtitles_changed)(on);
+        if let Some(mpv) = self.mpv() {
+            if on {
+                self.select_subtitles(&mpv);
+            } else {
+                mpv.set_string("sid", "no");
+            }
+        }
+    }
+
+    /// Shows the subtitle track in the viewer's language, or English, or
+    /// whichever comes first.
+    fn select_subtitles(&self, mpv: &Mpv) {
+        let wanted = tools::preferred_language();
+        let count = mpv.string("track-list/count").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(200);
+        let mut best: Option<(u8, String)> = None;
+        for i in 0..count {
+            if mpv.string(&format!("track-list/{i}/type")).as_deref() != Some("sub") {
+                continue;
+            }
+            let Some(id) = mpv.string(&format!("track-list/{i}/id")) else { continue };
+            let lang = mpv.string(&format!("track-list/{i}/lang")).unwrap_or_default().to_lowercase();
+            let score = if lang.starts_with(&wanted) {
+                2
+            } else if lang.starts_with("en") {
+                1
+            } else {
+                0
+            };
+            if best.as_ref().is_none_or(|(so_far, _)| score > *so_far) {
+                best = Some((score, id));
+            }
+        }
+        if let Some((_, id)) = best {
+            mpv.set_string("sid", &id);
+        }
+    }
+
     // ── Controls ───────────────────────────────────────────────────────
 
     fn toggle_pause(&self) {
         let Some(mpv) = self.mpv() else { return };
         if self.ended.get() {
+            self.cancel_autoplay();
             mpv.command_async(&["seek", "0", "absolute"]);
             mpv.set_flag("pause", false);
         } else {
@@ -1350,13 +1779,15 @@ impl Watch {
         }
     }
 
-    fn seek_to(&self, seconds: f64) {
+    pub fn seek_to(&self, seconds: f64) {
         let Some(mpv) = self.mpv() else { return };
+        self.cancel_autoplay();
         // Hold off position updates briefly so the bar doesn't jump back while seeking.
         self.seek_hold_until.set(glib::monotonic_time() + 500_000);
         self.seek_target.set(seconds);
         self.seek.set_value(seconds);
         mpv.command_async(&["seek", &format!("{seconds:.3}"), "absolute"]);
+        (self.hooks.seeked)(seconds);
     }
 
     fn start_over(&self) {
@@ -1365,14 +1796,14 @@ impl Watch {
         self.seek_to(0.0);
     }
 
-    fn seek_by(&self, delta: f64) {
+    pub fn seek_by(&self, delta: f64) {
         let end = self.duration.get().max(0.0);
         let seeking = glib::monotonic_time() < self.seek_hold_until.get();
         let from = if seeking { self.seek_target.get() } else { self.position.get() };
         self.seek_to((from + delta).clamp(0.0, end));
     }
 
-    fn set_volume(&self, volume: f64) {
+    pub fn set_volume(&self, volume: f64) {
         let Some(mpv) = self.mpv() else { return };
         mpv.set_double("volume", volume.clamp(0.0, 100.0));
         if self.muted.get() {
